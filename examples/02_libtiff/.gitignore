@@ -1,4 +1,2 @@
 target
-snapshot
-*.log
 Cargo.lock
