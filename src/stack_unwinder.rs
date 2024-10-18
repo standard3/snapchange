@@ -314,7 +314,9 @@ impl StackUnwinders {
                 let mut iter = backtrace.iter().skip(backtrace.len() - MAX_SAME_RECURSION);
 
                 // Get the first element from the iterator to check against
-                let Some(first) = iter.next() else { continue; };
+                let Some(first) = iter.next() else {
+                    continue;
+                };
 
                 if iter.all(|addr| addr == first) {
                     // Found a backtrace with too many recursions, end the backtrace here
@@ -351,15 +353,16 @@ pub fn get_instr_containing<FUZZER: Fuzzer>(
 ) -> u64 {
     // Starting from the largest possible instruction, look for a single instruction that decodes
     // such that the second instruction is at `next_instr`
-    for offset in (0..0x12).rev() {
+    for offset in (0..=0x10).rev() {
         //
-        let curr_addr = starting_addr - offset;
+        let curr_addr = starting_addr.wrapping_sub(offset);
 
         // Get the instruction for the current address
         let Ok(instr) = fuzzvm
             .memory
-            .get_instruction_at(VirtAddr(curr_addr), fuzzvm.cr3()) else {
-                continue;
+            .get_instruction_at(VirtAddr(curr_addr), fuzzvm.cr3())
+        else {
+            continue;
         };
 
         let ending_addr = curr_addr + instr.len() as u64;
@@ -370,7 +373,7 @@ pub fn get_instr_containing<FUZZER: Fuzzer>(
         }
     }
 
-    unreachable!();
+    unreachable!("Starting addr: {starting_addr:#x} Ending: {next_instr:#x}");
 }
 
 /// Stack unwinder for a single binary
@@ -403,15 +406,15 @@ impl StackUnwinder {
 
         // If we don't have an .eh_frame_hdr, return None
         let Some(ref eh_frame_hdr) = object.section_by_name(".eh_frame_hdr") else {
-                log::info!("{binary:?} has no .eh_frame_hdr");
-                return Ok(None);
-            };
+            log::info!("{binary:?} has no .eh_frame_hdr");
+            return Ok(None);
+        };
 
         // If we don't have an .eh_frame, return None
         let Some(ref eh_frame) = object.section_by_name(".eh_frame") else {
-                log::info!("{binary:?} has no .eh_frame");
-                return Ok(None);
-            };
+            log::info!("{binary:?} has no .eh_frame");
+            return Ok(None);
+        };
 
         // Set the address of the sections in the base addresses
         base_addresses = base_addresses.set_eh_frame_hdr(eh_frame_hdr.address() + base_address);
@@ -523,9 +526,13 @@ impl StackUnwinder {
                 let ret_addr =
                     state.regs[TrackedReg::Ra as usize].ok_or(UnwinderError::UnsetRaRegister)?;
 
-                // Get the beginning of the previous instruction
-                let instr_start = get_instr_containing(ret_addr - 1, ret_addr, fuzzvm);
-                state.set_rip(instr_start);
+                if ret_addr > 0 {
+                    // Get the beginning of the previous instruction
+                    let instr_start = get_instr_containing(ret_addr - 1, ret_addr, fuzzvm);
+                    state.set_rip(instr_start);
+                } else {
+                    return Err(UnwinderError::UnsetRaRegister);
+                }
 
                 // Return success
                 Ok(())

@@ -6,7 +6,7 @@ use std::convert::TryInto;
 
 /// A physical address
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PhysAddr(pub u64);
 
 impl PhysAddr {
@@ -49,12 +49,19 @@ impl std::ops::Deref for PhysAddr {
 
 /// A virtual address
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Hash)]
 pub struct VirtAddr(pub u64);
 
+// From<u64> for VirtAddr implies Into<VirtAddr> for u64
 impl From<u64> for VirtAddr {
     fn from(val: u64) -> VirtAddr {
         VirtAddr(val)
+    }
+}
+
+impl Into<u64> for VirtAddr {
+    fn into(self) -> u64 {
+        self.0
     }
 }
 
@@ -71,7 +78,9 @@ impl VirtAddr {
     #[allow(dead_code)]
     #[must_use]
     pub const fn offset(self, offset: u64) -> VirtAddr {
-        VirtAddr(self.0 + offset)
+        // encountered overflow panics here in debug builds. should be fine letting it overflow, no?
+        // VirtAddr(self.0 + offset)
+        VirtAddr(self.0.overflowing_add(offset).0)
     }
 
     /// Get the 4 page table indexes that this [`VirtAddr`] corresponds maps with when
@@ -126,7 +135,7 @@ impl std::str::FromStr for VirtAddr {
 
 /// A wrapper around the cr3
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
 pub struct Cr3(pub u64);
 
 impl std::ops::Deref for Cr3 {
@@ -134,5 +143,17 @@ impl std::ops::Deref for Cr3 {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl std::fmt::Debug for VirtAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VirtAddr({:#x})", self.0)
+    }
+}
+
+impl std::fmt::Debug for PhysAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PhysAddr({:#x})", self.0)
     }
 }

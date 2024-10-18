@@ -1,7 +1,6 @@
 //! Utilites for obtaining symbols for a given address for a variety of operating systems
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 
 use crate::fuzzer::ResetBreakpointType;
 
@@ -25,6 +24,11 @@ pub(crate) const LINUX_USERLAND_SYMBOLS: &[(&str, ResetBreakpointType)] = &[
     ("__GI_raise", ResetBreakpointType::Crash),
     // Reset when we hit exit
     ("__GI_exit", ResetBreakpointType::Reset),
+    ("ld-musl-x86_64.so.1!exit", ResetBreakpointType::Reset),
+    // This one is something we see with musl/static linking
+    ("__libc_exit_fini", ResetBreakpointType::Reset),
+    // Crash on assert()
+    ("__assert_fail", ResetBreakpointType::Crash),
 ];
 
 /// List of FULL linux kernel symbols that, if hit, signifies a special case to handle.
@@ -62,7 +66,7 @@ pub struct Symbol {
 }
 
 /// Get the symbol for the given `addr` using the given `symbols`
-pub fn get_symbol(addr: u64, symbols: &VecDeque<Symbol>) -> Option<String> {
+pub fn get_symbol(addr: u64, symbols: &crate::SymbolList) -> Option<String> {
     // Get the index to where this address can be found
     let index = symbols.binary_search_by_key(&addr, |Symbol { address, .. }| *address);
 

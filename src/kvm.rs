@@ -12,6 +12,7 @@ use vmm_sys_util::ioctl::{ioctl_with_ref, ioctl_with_val};
 
 use crate::fuzzer::Fuzzer;
 use crate::fuzzvm::FuzzVm;
+use crate::stats::PerfMark;
 
 /// Expression that calculates an ioctl number.
 ///
@@ -148,6 +149,8 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     ///
     /// * `KVM_GET_DIRTY_LOG` failed
     pub fn get_dirty_logs(&mut self) -> Result<()> {
+        let _timer = self.scoped_timer(PerfMark::GetDirtyLogs);
+
         for (slot, bitmap) in self.dirty_bitmaps.iter_mut().enumerate() {
             // Create the structure for this clear
             let dirty_bitmap = bitmap.as_mut_ptr().cast::<libc::c_void>();
@@ -182,9 +185,9 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     ///
     /// * Somehow the `core_id` doesn't fit in a usize
     pub fn clear_dirty_logs(&mut self) -> Result<()> {
-        for (slot, bitmap) in self.dirty_bitmaps.iter_mut().enumerate() {
-            // for (slot, bitmap) in DIRTY_BITMAPS[usize::try_from(self.core_id).unwrap()].iter().enumerate() {
+        let _timer = self.scoped_timer(PerfMark::ClearDirtyLogs);
 
+        for (slot, bitmap) in self.dirty_bitmaps.iter_mut().enumerate() {
             let dirty_bitmap = bitmap.as_mut_ptr().cast::<libc::c_void>();
 
             let clear_log = kvm_clear_dirty_log {

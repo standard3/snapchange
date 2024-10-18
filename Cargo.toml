@@ -29,11 +29,15 @@ clap-verbosity-flag = "2.0"
 rand          = "0.8"
 rand_core     = "0.6"
 ahash         = "0.8"
+rustc-hash    = "1.1.0"
+indexmap = "2.1"
+smallvec = { version = "1", features = ["union", "const_generics"] }
 
 # For addr2line implementation 
-addr2line     = "0.17.0"
+addr2line     = "0.21"
 memmap        = "0.7"
-object        = { version = "0.27.1", default-features = false, features = ["read"], optional = true }
+memmap2       = "0.9"
+object        = { version = "0.32", default-features = false, features = ["read"], optional = true }
 
 # For MSRs to/from primitive
 num_enum     = "0.5.7"
@@ -43,6 +47,7 @@ tui = "0.19.0"
 crossterm = "0.22.1"
 tui-logger = "0.8.1"
 toml = "0.7.2"
+extended = "0.1.0"
 
 [profile.release]
 debug = true
@@ -50,4 +55,8 @@ incremental = true
 
 [features]
 default = []
+# default = ["redqueen", "custom_feedback"]
 redqueen = []
+custom_feedback = []
+# this is only for debugging snapchange itself
+fuzz_single_step = []

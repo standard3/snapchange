@@ -62,10 +62,10 @@
 //!         Ok(())
 //!     }
 //!
-//!     fn reset_breakpoints(&self) -> Option<&[BreakpointLookup]> {
+//!     fn reset_breakpoints(&self) -> Option<&[AddressLookup]> {
 //!         Some(&[
 //!             // Reset when the VM hits example1!main+0x123
-//!             BreakpointLookup::SymbolOffset("example1!main", 0x123)
+//!             AddressLookup::SymbolOffset("example1!main", 0x123)
 //!         ])
 //!     }
 //! }
@@ -97,24 +97,25 @@
 #![feature(trait_alias)]
 #![feature(thread_id_value)]
 #![feature(map_try_insert)]
-#![feature(stdsimd)]
 #![feature(avx512_target_feature)]
 #![feature(core_intrinsics)]
-#![feature(const_discriminant)]
 #![feature(associated_type_defaults)]
 #![feature(variant_count)]
 #![feature(path_file_prefix)]
 #![feature(iter_array_chunks)]
 #![feature(stmt_expr_attributes)]
 #![allow(rustdoc::invalid_rust_codeblocks)]
-#![deny(missing_docs)]
+#![allow(internal_features)]
+// #![deny(missing_docs)]
 
+use feedback::FeedbackTracker;
 use kvm_bindings::{
     kvm_cpuid2, kvm_userspace_memory_region, CpuId, KVM_MAX_CPUID_ENTRIES, KVM_MEM_LOG_DIRTY_PAGES,
     KVM_SYNC_X86_EVENTS, KVM_SYNC_X86_REGS, KVM_SYNC_X86_SREGS,
 };
 use kvm_ioctls::{Cap, Kvm, VmFd};
 
+pub use anyhow;
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 
@@ -123,13 +124,14 @@ use vmm_sys_util::fam::FamStructWrapper;
 
 extern crate bitflags;
 
-use std::collections::{BTreeMap, VecDeque};
 use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+pub use rand;
 
 pub mod fuzzvm;
 pub use fuzzvm::{FuzzVm, FuzzVmExit};
@@ -154,7 +156,6 @@ mod page_table;
 
 pub mod fuzzer;
 pub use fuzzer::Fuzzer;
-use fuzzer::ResetBreakpointType;
 
 mod symbols;
 pub use symbols::Symbol;
@@ -175,20 +176,23 @@ mod kvm;
 pub mod linux;
 
 pub mod memory;
-pub use memory::GUEST_MEMORY_SIZE;
+pub use memory::Memory;
 
 mod colors;
 mod commands;
 
 mod coverage_analysis;
 pub mod expensive_mutators;
+pub mod feedback;
 mod filesystem;
 pub mod fuzz_input;
 pub mod mutators;
 
 mod stats_tui;
 pub mod utils;
-pub use fuzz_input::FuzzInput;
+pub use utils::write_crash_input;
+
+pub use fuzz_input::{FuzzInput, InputWithMetadata};
 
 #[macro_use]
 mod try_macros;
@@ -202,6 +206,12 @@ pub mod _docs;
 
 // #[global_allocator]
 // static GLOBAL: MiMalloc = MiMalloc;
+
+pub(crate) type FxIndexMap<K, V> =
+    indexmap::IndexMap<K, V, core::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+pub(crate) type FxIndexSet<K> =
+    indexmap::IndexSet<K, core::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+pub(crate) type AIndexSet<K> = indexmap::IndexSet<K, ahash::RandomState>;
 
 /// `dbg!` but with hex output
 #[macro_export]
@@ -230,7 +240,7 @@ macro_rules! dbg_hex {
 }
 
 /// What to do after handling a [`FuzzVmExit`]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Execution {
     /// Hit coverage event and continue execution of the current VM
     CoverageContinue,
@@ -253,8 +263,37 @@ pub enum Execution {
     Reset,
 }
 
+impl Execution {
+    /// Returns true if the given Execution state is a crash.
+    pub fn is_crash(&self) -> bool {
+        match &self {
+            Self::CrashReset { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Returns true if the given Execution state is a crash.
+    pub fn is_reset(&self) -> bool {
+        match &self {
+            Self::CrashReset { .. } => true,
+            Self::Reset | Self::TimeoutReset => true,
+            _ => false,
+        }
+    }
+
+    /// Create a new `Execution::CrashReset` with the given crash_name as string.
+    pub fn new_crash<T: Into<String>>(crash_name: T) -> Self {
+        Self::CrashReset {
+            path: crash_name.into(),
+        }
+    }
+}
+
+/// List of [`Symbol`] sorted in order by address. Always allows to `binary_search_by_key`.
+pub type SymbolList = Vec<Symbol>;
+
 /// Maximum number of cores supported
-pub(crate) static MAX_CORES: usize = 200;
+pub(crate) const MAX_CORES: usize = 200;
 
 lazy_static::lazy_static! {
      /// List of Thread IDs created for the fuzz workers used to send signals to forcibly
@@ -262,17 +301,6 @@ lazy_static::lazy_static! {
      pub static ref THREAD_IDS: Vec<Mutex<Option<u64>>> = (0..MAX_CORES)
          .map(|_| Mutex::new(None))
          .collect();
-
-    /// Densely packed dirty bitmap pointers for each core
-    pub static ref DIRTY_BITMAPS: Vec<[AtomicPtr<libc::c_void>; 3]> = (0..MAX_CORES)
-        .map(|_| {
-            [
-                AtomicPtr::new(std::ptr::null_mut()),
-                AtomicPtr::new(std::ptr::null_mut()),
-                AtomicPtr::new(std::ptr::null_mut())
-            ]
-        })
-        .collect();
 }
 
 /// Set by a timer, signals the main thread to kick all cores out of execution
@@ -280,7 +308,7 @@ lazy_static::lazy_static! {
 pub static KICK_CORES: AtomicBool = AtomicBool::new(false);
 
 /// Signals that the main thread is finished and the stats worker can exit
-pub(crate) static FINISHED: AtomicBool = AtomicBool::new(false);
+pub static FINISHED: AtomicBool = AtomicBool::new(false);
 
 /// Current number of columns in the terminal
 static COLUMNS: AtomicUsize = AtomicUsize::new(0);
@@ -306,63 +334,21 @@ fn unblock_sigalrm() -> Result<()> {
 /// Maximum of crash files to write to a given directory
 pub(crate) const MAX_CRASHES: usize = 64;
 
-/// Write the given `input` into `crash_dir`/`path`, allowing the given [`Fuzzer`] to
-/// handle the crash as well.
-///
-/// # Returns
-///
-/// * Path to input file written
-fn write_crash_input(
-    crash_dir: &Path,
-    path: &str,
-    input: &[u8],
-    console_output: &[u8],
-) -> Result<Option<PathBuf>> {
-    let crash_dir = crash_dir.join(path);
-
-    if path.contains("Oops") {
-        return Ok(None);
-    }
-
-    if !crash_dir.exists() {
-        let _ = std::fs::create_dir_all(&crash_dir);
-    }
-
-    if crash_dir.read_dir()?.count() < MAX_CRASHES {
-        // Create the filename for this input
-        let h = crate::utils::hexdigest(&input);
-        // Write the input
-        let filepath = crash_dir.join(h);
-        if !filepath.exists() {
-            let _ = std::fs::write(&filepath, input);
-        }
-
-        // If there is console_output, write it as well
-        if !console_output.is_empty() {
-            let output_file = filepath.with_extension("console_output");
-            let _ = std::fs::write(output_file, console_output);
-        }
-
-        return Ok(Some(filepath));
-    }
-
-    Ok(None)
-}
-
 /// Handle the given [`FuzzVmExit`]
 fn handle_vmexit<FUZZER: Fuzzer>(
     vmexit: &FuzzVmExit,
     fuzzvm: &mut FuzzVm<FUZZER>,
     fuzzer: &mut FUZZER,
     crash_dir: Option<&Path>,
-    input: &FUZZER::Input,
+    input: &InputWithMetadata<FUZZER::Input>,
+    feedback: Option<&mut FeedbackTracker>,
 ) -> Result<Execution> {
     let execution;
 
     // Determine what to do with the VMExit
     match vmexit {
         FuzzVmExit::Breakpoint(rip) => {
-            match fuzzvm.handle_breakpoint(fuzzer, input) {
+            match fuzzvm.handle_breakpoint(fuzzer, input, feedback) {
                 Err(err) => {
                     // log::warn!("Breakpoint fail.. reset: {err:?}");
 
@@ -372,7 +358,11 @@ fn handle_vmexit<FUZZER: Fuzzer>(
                         .unwrap_or_else(|| "Unknown symbol".to_string());
 
                     execution = Execution::CrashReset {
-                        path: format!("{}_weird_bp_{rip:#x}_{sym}", err.root_cause()),
+                        path: format!(
+                            "{}_weird_bp_{rip:#x}_cr3_{:x?}_{sym}",
+                            err.root_cause(),
+                            fuzzvm.cr3().0
+                        ),
                     };
                 }
                 Ok(res) => {
@@ -448,13 +438,14 @@ fn handle_vmexit<FUZZER: Fuzzer>(
                 let _bp = fuzzvm.rdx();
                 let crashing_addr = fuzzvm.rcx();
                 let is_write = fuzzvm.r8b();
-                let size = fuzzvm.r9b();
+                let _size = fuzzvm.r9b();
                 fatal = fuzzvm.read::<bool>(VirtAddr(fuzzvm.rsp() + 0x10), fuzzvm.cr3())?;
 
                 let symbol = fuzzvm.get_symbol(pc).unwrap_or_default();
                 let op = if is_write > 0 { "WRITE" } else { "READ" };
 
-                format!("ASAN_{op}{size}_pc:{pc:#x}_crashing_addr:{crashing_addr:#x}_{symbol}")
+                // format!("ASAN_{op}{size}_pc:{pc:#x}_crashing_addr:{crashing_addr:#x}_{symbol}")
+                format!("ASAN_{op}_pc:{pc:#x}_crashing_addr:{crashing_addr:#x}_{symbol}")
             } else if sym.contains("ReportOutOfMemory") {
                 let alloc = fuzzvm.rdi();
                 if alloc >= 4 * 1024 * 1024 * 1024 {
@@ -491,11 +482,8 @@ fn handle_vmexit<FUZZER: Fuzzer>(
                 Execution::Continue
             };
 
-            let mut input_bytes = Vec::new();
-            input.to_bytes(&mut input_bytes)?;
-
             if let Some(crash_file) =
-                write_crash_input(&crash_dir, &dirname, &input_bytes, &fuzzvm.console_output)?
+                write_crash_input(&crash_dir, &dirname, &input, &fuzzvm.console_output)?
             {
                 // Allow the fuzzer to handle the crashing state
                 // Useful for things like syscall fuzzer to write a C file from the input
@@ -511,13 +499,16 @@ fn handle_vmexit<FUZZER: Fuzzer>(
             execution = Execution::Reset;
         }
         FuzzVmExit::IoOut(port) => {
-            log::debug!("IoOut {port:#x}");
-            execution = Execution::CrashReset {
-                path: format!(
-                    "misc/IoOut_Port_{port:#x}_current_cr3_{:x?}_original_cr3_{:x?}",
-                    fuzzvm.cr3().0,
-                    fuzzvm.vbcpu.cr3
-                ),
+            if *port == 0x3f9 {
+                execution = Execution::Continue;
+            } else {
+                execution = Execution::CrashReset {
+                    path: format!(
+                        "misc/IoOut_Port_{port:#x}_current_cr3_{:x?}_original_cr3_{:x?}",
+                        fuzzvm.cr3().0,
+                        fuzzvm.vbcpu.cr3
+                    ),
+                }
             }
         }
         FuzzVmExit::ForceSigFaultBreakpoint(signal) => {
@@ -533,17 +524,26 @@ fn handle_vmexit<FUZZER: Fuzzer>(
             // Get the output directory name for this crash
             let dirname = match signal {
                 linux::Signal::SegmentationFault { code, address } => {
-                    format!("SIGSEGV_addr_{address:#x}_code_{code:x?}")
+                    format!(
+                        "SIGSEGV_addr_{address:#x}_cr3_{:x?}_code_{code:x?}",
+                        fuzzvm.cr3().0
+                    )
                 }
                 linux::Signal::IllegalInstruction { code, address } => {
-                    format!("SIGILL_addr_{address:#x}_code_{code:?}")
+                    format!(
+                        "SIGILL_addr_{address:#x}_cr3_{:x?}_code_{code:?}",
+                        fuzzvm.cr3().0
+                    )
                 }
                 linux::Signal::Unknown {
                     signal,
                     code,
                     arg: _,
                 } => {
-                    format!("ForceSigFault_Unknown_sig{signal:#x}_code{code:#x}")
+                    format!(
+                        "ForceSigFault_Unknown_sig{signal:#x}_code{code:#x}_cr3_{:x?}",
+                        fuzzvm.cr3().0
+                    )
                 }
                 linux::Signal::Trap => {
                     // Immediately return from the function
@@ -654,6 +654,7 @@ fn handle_vmexit<FUZZER: Fuzzer>(
 pub fn register_guest_memory(
     vm: &VmFd,
     memory: *mut libc::c_void,
+    guest_memory_size: u64,
 ) -> Result<[kvm_userspace_memory_region; 3]> {
     ensure!(fuzzvm::APIC_BASE < fuzzvm::TSS_BASE);
 
@@ -705,7 +706,7 @@ pub fn register_guest_memory(
     memory_regions[1] = mem_region;
 
     // Calculate the length of the remaining memory after the APIC page
-    size_remainder = GUEST_MEMORY_SIZE - fuzzvm::TSS_BASE - 0x1000;
+    size_remainder = guest_memory_size - fuzzvm::TSS_BASE - 0x1000;
 
     // Allocate memory from [TSS_BASE + 0x1000..] in the guest
     let mem_region = kvm_userspace_memory_region {
@@ -775,7 +776,7 @@ pub fn sanity_check_kvm(kvm: &Kvm) {
 }
 
 /// Kick cores when triggered by a signal
-fn kick_cores() {
+pub(crate) fn kick_cores() {
     loop {
         if crate::FINISHED.load(Ordering::SeqCst) {
             log::info!("[kick_cores] FINISHED");
@@ -808,7 +809,7 @@ fn kick_cores() {
 }
 
 /// Block SIGALRM for this thread
-fn block_sigalrm() -> Result<()> {
+pub(crate) fn block_sigalrm() -> Result<()> {
     let mut curr_sigset = SigSet::empty();
 
     // Get the current unblocked signal set
@@ -862,42 +863,13 @@ struct KvmEnvironment {
 
     /// The address of the clean snapshot with coverage breakpoints applied. This is the
     /// memory region that the cores will use to restore the original snapshot during fuzzing
-    clean_snapshot_addr: u64,
+    clean_snapshot: Arc<RwLock<Memory>>,
 
     /// Parsed symbols if the project has symbols available
-    symbols: Option<VecDeque<Symbol>>,
+    symbols: Option<SymbolList>,
 
-    /// Parsed symbol breakpoints if any coverage breakpoints are avilable in the project
-    symbol_breakpoints: Option<BTreeMap<(VirtAddr, Cr3), ResetBreakpointType>>,
-}
-
-/// Create the guest memory backing for the VM using the given snapshot file
-/// descriptor.
-///
-/// # Errors
-///
-/// * Guest memory size is too small to fit in a `usize`
-fn create_guest_memory_backing(snapshot_fd: i32) -> Result<*mut libc::c_void> {
-    // Ensure the expected guest memory size can fit on this system
-    let guest_memory_size: usize = GUEST_MEMORY_SIZE.try_into()?;
-
-    // Create the memory backing from the file descriptor
-    let mem_ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            guest_memory_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE,
-            snapshot_fd,
-            0,
-        )
-    };
-
-    unsafe {
-        libc::madvise(mem_ptr, guest_memory_size, libc::MADV_MERGEABLE);
-    }
-
-    Ok(mem_ptr)
+    /// Parsed symbol breakpoints if any coverage breakpoints are available in the project
+    symbol_breakpoints: Option<fuzzvm::ResetBreakpoints>,
 }
 
 /// Perform KVM initialization routines and common project setup steps for all
@@ -929,15 +901,17 @@ fn init_environment(project_state: &ProjectState) -> Result<KvmEnvironment> {
         .read(true)
         .open(&project_state.physical_memory)?;
 
+    let guest_memory_size = project_state.config.guest_memory_size;
+
     // Ensure the mmap'ed memory for the snapshot is large enough
     ensure!(
-        GUEST_MEMORY_SIZE >= physmem_file.metadata()?.len(),
+        guest_memory_size >= physmem_file.metadata()?.len(),
         "Snapshot physical memory is larger than expected. \
-         Increase guest_memory::GUEST_MEMORY_SIZE"
+         Increase config::guest_memory_size"
     );
 
     // Ensure the expected guest memory size can fit on this system
-    let guest_memory_size = GUEST_MEMORY_SIZE
+    let guest_memory_size: usize = guest_memory_size
         .try_into()
         .expect("Guest memory size too large");
 
@@ -958,14 +932,17 @@ fn init_environment(project_state: &ProjectState) -> Result<KvmEnvironment> {
         "Failed to mmap clean snapshot"
     );
 
-    let clean_snapshot_addr = clean_snapshot_buff as u64;
+    let clean_snapshot = Arc::new(RwLock::new(Memory::from_addr(
+        clean_snapshot_buff as u64,
+        guest_memory_size.try_into().unwrap(),
+    )));
 
     // Return the created environment
     Ok(KvmEnvironment {
         kvm,
         cpuids,
         physmem_file,
-        clean_snapshot_addr,
+        clean_snapshot,
         symbols,
         symbol_breakpoints,
     })
@@ -1042,6 +1019,7 @@ pub fn snapchange_main<FUZZER: Fuzzer + 'static>() -> Result<()> {
         SubCommand::Project(args) => commands::project::run(&proj_state, &args),
         SubCommand::Coverage(args) => commands::coverage::run::<FUZZER>(&proj_state, &args),
         SubCommand::FindInput(args) => commands::find_input::run::<FUZZER>(&proj_state, &args),
+        SubCommand::CorpusMin(args) => commands::corpus_min::run::<FUZZER>(&proj_state, &args),
 
         #[cfg(feature = "redqueen")]
         SubCommand::Redqueen(args) => commands::redqueen::run::<FUZZER>(&proj_state, &args),
@@ -1051,4 +1029,36 @@ pub fn snapchange_main<FUZZER: Fuzzer + 'static>() -> Result<()> {
     tui_logger::move_events();
 
     res
+}
+
+/// Import most important snapchange functions, traits, and types.
+/// ```
+/// use snapchange::prelude::*;
+/// ```
+pub mod prelude {
+    // this is useful for the `slice.choose(rng)` calls.
+    pub use super::rand::seq::{IteratorRandom, SliceRandom};
+    // need this for `let v: u32 = rng.gen()` style calls
+    pub use super::rand::Rng as _;
+    // now bring the most important things from snapchange into scope
+    pub use super::{
+        addrs::{Cr3, VirtAddr},
+        anyhow,
+        anyhow::Result,
+        fuzz_input::{BytesMinimizeState, MinimizeControlFlow, MinimizerState, NullMinimizerState},
+        fuzzer::{AddressLookup, Breakpoint, BreakpointType, Fuzzer},
+        fuzzvm::FuzzVm,
+        rand,
+        rng::Rng,
+        snapchange_main, Execution, FuzzInput, InputWithMetadata,
+    };
+
+    #[cfg(feature = "custom_feedback")]
+    pub use super::feedback::FeedbackTracker;
+
+    #[cfg(feature = "redqueen")]
+    pub use super::cmp_analysis::RedqueenRule;
+
+    #[cfg(feature = "redqueen")]
+    pub use rustc_hash::FxHashSet;
 }

@@ -1,16 +1,18 @@
 //! Various methods used to mutate inputs that are inherently expensive due to the
 //! possibility of re-allocating the input
 //!
-use crate::fuzz_input::FuzzInput;
-use crate::rng::Rng;
-use crate::try_isize;
 
 use rand::Rng as _;
+use std::sync::Arc;
+
+use crate::fuzz_input::FuzzInput;
+use crate::fuzz_input::InputWithMetadata;
+use crate::rng::Rng;
 
 /// Insert a random slice from the corpus into the `input`, expanding the `input`
 pub(crate) fn splice_corpus_extend(
     input: &mut Vec<u8>,
-    corpus: &[Vec<u8>],
+    corpus: &[Arc<InputWithMetadata<Vec<u8>>>],
     rng: &mut Rng,
     _dictionary: &Option<Vec<Vec<u8>>>,
 ) -> Option<String> {
@@ -25,7 +27,7 @@ pub(crate) fn splice_corpus_extend(
     let rand_num4 = rng.gen::<usize>();
 
     // Get the input which the comes will come from from the corpus
-    let splice_from = &corpus[rand_num1 % corpus.len()];
+    let splice_from = &corpus[rand_num1 % corpus.len()].input;
     let splice_from_hash = splice_from.fuzz_hash();
 
     let max_splice_len = std::cmp::min(splice_from.len(), input.len());
@@ -39,28 +41,77 @@ pub(crate) fn splice_corpus_extend(
     let splice_offset = rand_num3 % (splice_from.len() - splice_len);
     let input_offset = rand_num4 % (input.len() - splice_len);
 
-    let orig_len = input.len();
-
-    // Resize the input to fit the splice
-    input.resize(input.len() + splice_len, 0);
-
-    // Copy the bytes that will be overwritten by the splice
-    unsafe {
-        let src = try_isize!(input_offset);
-        let dst = try_isize!(input_offset + splice_len);
-
-        std::ptr::copy(
-            input.as_mut_ptr().offset(src),
-            input.as_mut_ptr().offset(dst),
-            orig_len - input_offset,
-        );
-    }
-
-    // Insert the splice
-    input[input_offset..input_offset + splice_len]
-        .copy_from_slice(&splice_from[splice_offset..splice_offset + splice_len]);
+    crate::utils::vec::splice_into(
+        input,
+        input_offset..(input_offset + splice_len),
+        &splice_from[splice_offset..splice_offset + splice_len],
+    );
 
     Some(format!(
         "SpliceCorpusExtend_offset_{input_offset:#x}_len_{splice_len:#x}_other_{splice_from_hash:#x}"
     ))
+}
+
+/// Insert a random dictionary entry into the `input`, potentially expanding the `input`.
+pub(crate) fn splice_from_dictionary_extend(
+    input: &mut Vec<u8>,
+    _corpus: &[Arc<InputWithMetadata<Vec<u8>>>],
+    rng: &mut Rng,
+    dictionary: &Option<Vec<Vec<u8>>>,
+) -> Option<String> {
+    if dictionary.is_none() {
+        return None;
+    }
+    let dictionary = dictionary.as_ref().unwrap();
+    if dictionary.is_empty() {
+        return None;
+    }
+
+    // select renadom dictionary entry
+    let dict_idx = rng.gen_range(0..dictionary.len());
+    let splice_from = &dictionary[dict_idx];
+    if splice_from.is_empty() {
+        // should never happen...
+        return None;
+    }
+    // random offset into the input
+    let input_offset = if input.is_empty() {
+        0
+    } else {
+        rng.gen_range(0..input.len())
+    };
+
+    // we replace bytes up to the length of the dictionary entry. 0 will insert without overwriting.
+    let splice_len = rng.gen_range(0..splice_from.len());
+    crate::utils::vec::splice_into(
+        input,
+        input_offset..(input_offset + splice_len),
+        &splice_from[..],
+    );
+
+    Some(format!(
+        "DictionarySpliceExtend_offset_{input_offset:#x}_splicelen_{splice_len}_dictidx_{dict_idx}"
+    ))
+}
+
+/// Insert an element from the dictionary into the input
+pub fn remove_slice(
+    input: &mut Vec<u8>,
+    _corpus: &[Arc<InputWithMetadata<Vec<u8>>>],
+    rng: &mut Rng,
+    _dictionary: &Option<Vec<Vec<u8>>>,
+) -> Option<String> {
+    if input.len() <= 2 {
+        return None;
+    }
+
+    let offset = rng.gen_range(0..input.len() - 2);
+    let size = rng.gen_range(1..(input.len() - offset).max(1));
+    let range = offset..offset + size;
+    let mutation = format!("RemoveRange_offset_{range:?}");
+
+    // Remove the slice
+    *input = input.drain(range).collect();
+
+    Some(mutation)
 }

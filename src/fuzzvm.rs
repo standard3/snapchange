@@ -19,12 +19,19 @@ use thiserror::Error;
 use x86_64::registers::control::{Cr0Flags, Cr4Flags, EferFlags};
 use x86_64::registers::rflags::RFlags;
 
+#[cfg(feature = "redqueen")]
+use ahash::HashSetExt;
+#[cfg(feature = "redqueen")]
+use rustc_hash::FxHashSet;
+
 use crate::addrs::{Cr3, PhysAddr, VirtAddr};
 use crate::colors::Colorized;
 use crate::config::Config;
 use crate::exception::Exception;
+use crate::feedback::FeedbackTracker;
 use crate::filesystem::FileSystem;
-use crate::fuzzer::{Breakpoint, BreakpointLookup, BreakpointType, Fuzzer, ResetBreakpointType};
+use crate::fuzz_input::InputWithMetadata;
+use crate::fuzzer::{AddressLookup, Breakpoint, BreakpointType, Fuzzer, ResetBreakpointType};
 use crate::interrupts::IdtEntry;
 use crate::linux::{PtRegs, Signal};
 use crate::memory::{ChainVal, Memory, WriteMem};
@@ -32,21 +39,30 @@ use crate::msr::Msr;
 use crate::page_table::Translation;
 use crate::rng::Rng;
 use crate::stack_unwinder::{StackUnwinders, UnwindInfo};
+use crate::stats::{PerfMark, PerfStatTimer, Stats};
 use crate::symbols::Symbol;
-use crate::utils::rdtsc;
+
 use crate::vbcpu::VbCpu;
-use crate::{handle_vmexit, Execution, DIRTY_BITMAPS};
+use crate::{handle_vmexit, Execution, SymbolList};
 use crate::{try_u32, try_u64, try_u8, try_usize};
 
 #[cfg(feature = "redqueen")]
-use crate::{cmp_analysis::RedqueenRule, fuzz_input::FuzzInput};
-use std::collections::{BTreeMap, VecDeque};
+use crate::{
+    cmp_analysis::{RedqueenArguments, RedqueenRule},
+    fuzz_input::FuzzInput,
+};
+
+use std::collections::BTreeMap;
 use std::convert::TryInto;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "redqueen")]
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+    sync::atomic::Ordering,
+};
 
 /// APIC base we are expecting the guest to adhere to. Primarily comes into play when
 /// mapping guest memory regions in KVM as we need to leave to leave a gap in the guest
@@ -71,14 +87,32 @@ pub enum BreakpointMemory {
     NotDirty,
 }
 
+/// Type that stores coverage breakpoints.
+pub type CoverageBreakpoints = crate::FxIndexMap<VirtAddr, u8>;
+/// Map a tuple `(VirtAddr, Cr3)` pair to a index. Used to retrieve e.g., a breakpoint handler.
+pub type Breakpoints = crate::FxIndexMap<(VirtAddr, Cr3), usize>;
+/// Map a tuple `(VirtAddr, Cr3)` to a [`ResetBreakpointType`].
+pub type ResetBreakpoints = crate::FxIndexMap<(VirtAddr, Cr3), ResetBreakpointType>;
+
 /// Hook function protoype
-pub type HookFn<F> =
-    fn(fuzzvm: &mut FuzzVm<F>, input: &<F as Fuzzer>::Input, fuzzer: &mut F) -> Result<Execution>;
+pub type HookFn<F> = fn(
+    fuzzvm: &mut FuzzVm<F>,
+    input: &InputWithMetadata<<F as Fuzzer>::Input>,
+    fuzzer: &mut F,
+    feedback: Option<&mut crate::feedback::FeedbackTracker>,
+) -> Result<Execution>;
 
 /// Type of custom hook to call when a breakpoint is triggered
 pub enum BreakpointHook<FUZZER: Fuzzer> {
     /// Call the given function when this breakpoint is hit
     Func(HookFn<FUZZER>),
+
+    /// Call the redqueen parsing
+    #[cfg(feature = "redqueen")]
+    Redqueen(Vec<RedqueenArguments>),
+
+    /// intentionally ignore this breakpoint for breakpoint hooks.
+    Ignore,
 
     /// No breakpoint hook function set for this breakpoint
     None,
@@ -135,9 +169,9 @@ pub enum Error {
     #[error("Call to sysconf failed")]
     SysconfFailed(nix::errno::Errno),
 
-    /// Fuzzer breakpoint was not found in the symbols
-    #[error("Fuzzer breakpoint was not found in symbols: {0}+{1:#x}")]
-    FuzzerBreakpointNotFound(&'static str, u64),
+    /// Lookup symbol was not found in the symbols
+    #[error("Lookup symbol was not found in symbols: {0}+{1:#x}")]
+    LookupSymbolNotFound(&'static str, u64),
 
     /// Symbol breakpoints are not implemented for Redqueen breakpoints
     #[error("Symbol breakpoints are not implemented for Redqueen breakpoints")]
@@ -411,57 +445,12 @@ pub struct VmRunPerf {
     pub post_run_vm: u64,
 }
 
-/// Cycle counts while resetting guest state
-#[derive(Default, Debug, Copy, Clone)]
-pub struct GuestResetPerf {
-    /// Amount of time spent during restoring guest memory found by KVM
-    pub reset_guest_memory_restore: u64,
-
-    /// Amount of time spent during resetting dirty pages set by a fuzzer
-    pub reset_guest_memory_custom: u64,
-
-    /// Amount of time spent clearing the dirty page bits
-    pub reset_guest_memory_clear: u64,
-
-    /// Amount of time spent during gathering dirty logs from KVM
-    pub get_dirty_logs: u64,
-
-    /// Number of pages restored
-    pub restored_pages: u32,
-
-    /// Amount of time during running `fuzzvm.init_guest`
-    pub init_guest: InitGuestPerf,
-
-    /// Amount of time during running `fuzzer.apply_fuzzer_breakpoint`
-    pub apply_fuzzer_breakpoints: u64,
-
-    /// Amount of time during running `fuzzer.apply_reset_breakpoint`
-    pub apply_reset_breakpoints: u64,
-
-    /// Amount of time during running `fuzzer.apply_coverage_breakpoint`
-    pub apply_coverage_breakpoints: u64,
-
-    /// Amount of time during running `fuzzer.init_vm`
-    pub init_vm: u64,
-}
-
-/// Cycle counts while initialzing the guest
-#[derive(Default, Debug, Copy, Clone)]
-pub struct InitGuestPerf {
-    /// Amount of time during running `fuzzvm.init_guest` restoring registers
-    pub regs: u64,
-
-    /// Amount of time during running `fuzzvm.init_guest` restoring sregs
-    pub sregs: u64,
-
-    /// Amount of time during running `fuzzvm.init_guest` restoring fpu
-    pub fpu: u64,
-
-    /// Amount of time during running `fuzzvm.init_guest` restoring MSRs
-    pub msrs: u64,
-
-    /// Amount of time during running `fuzzvm.init_guest` restoring debug registers
-    pub debug_regs: u64,
+impl std::ops::AddAssign for VmRunPerf {
+    fn add_assign(&mut self, rhs: VmRunPerf) {
+        self.in_vm += rhs.in_vm;
+        self.pre_run_vm += rhs.pre_run_vm;
+        self.post_run_vm += rhs.post_run_vm;
+    }
 }
 
 /// Lightweight VM used for fuzzing a memory snapshot
@@ -484,7 +473,7 @@ pub struct FuzzVm<'a, FUZZER: Fuzzer> {
     pub sregs: kvm_sregs,
 
     // /// Current fpu state in the VM
-    // fpu: kvm_fpu,
+    // pub fpu: kvm_fpu,
     /// Current VCPU events from KVM
     pub vcpu_events: kvm_vcpu_events,
 
@@ -505,7 +494,7 @@ pub struct FuzzVm<'a, FUZZER: Fuzzer> {
     /// Breakpoints currently set in the VM keyed with their original byte to potentially
     /// restore after it has been hit. The value in this map is the index into the
     /// various breakpoint arrays. This DOES NOT contain coverage breakpoints.
-    pub breakpoints: BTreeMap<(VirtAddr, Cr3), usize>,
+    pub breakpoints: Breakpoints,
 
     /// Original bytes for breakpoints in the VM indexed by the value in
     /// `self.breakpoints`.
@@ -527,7 +516,7 @@ pub struct FuzzVm<'a, FUZZER: Fuzzer> {
     pub restore_breakpoint: Option<(VirtAddr, Cr3)>,
 
     /// Clean snapshot buffer to restore the dirty pages from
-    pub clean_snapshot: u64,
+    pub clean_snapshot: Arc<RwLock<Memory>>,
 
     /// Memory regions backing this VM (used for deleting the regions to reset the memory
     /// on VM reset)
@@ -548,7 +537,7 @@ pub struct FuzzVm<'a, FUZZER: Fuzzer> {
     /// Current set of single shot breakpoints set that, when hit, add the address to the
     /// coverage database.  This is an Option to enable a `.take()` to avoid a
     /// `&mut self ` collision when applying then breakpoints
-    pub coverage_breakpoints: Option<BTreeMap<VirtAddr, u8>>,
+    pub coverage_breakpoints: Option<CoverageBreakpoints>,
 
     /// Signifies if this VM will exit on syscalls. Handles whether
     /// `EferFlags::SYSTEM_CALL_EXTENSIONS` is enabled.
@@ -557,10 +546,10 @@ pub struct FuzzVm<'a, FUZZER: Fuzzer> {
     /// Breakpoints that, if hit, signify a crash or reset in the guest. This is an
     /// Option to enable a `.take()` to avoid a `&mut self ` collision when applying then
     /// breakpoints
-    pub reset_breakpoints: Option<BTreeMap<(VirtAddr, Cr3), ResetBreakpointType>>,
+    pub reset_breakpoints: Option<ResetBreakpoints>,
 
     /// List of symbols available in this VM
-    pub symbols: &'a Option<VecDeque<Symbol>>,
+    pub symbols: &'a Option<SymbolList>,
 
     /// Start time of the current fuzz case, used to determine if the VM should be timed
     /// out
@@ -591,9 +580,71 @@ pub struct FuzzVm<'a, FUZZER: Fuzzer> {
     /// Collection of unwinders used to attempt to unwind the stack
     pub unwinders: Option<StackUnwinders>,
 
+    /// The statistics struct for this VM
+    pub core_stats: Option<Arc<Mutex<Stats<FUZZER>>>>,
+
     /// Set of redqueen rules used for cmp analysis (our RedQueen implementation)
     #[cfg(feature = "redqueen")]
-    pub redqueen_rules: BTreeMap<u64, BTreeSet<RedqueenRule>>,
+    pub redqueen_rules: BTreeMap<u64, FxHashSet<RedqueenRule>>,
+
+    /// Parsed redqueen breakpoints used to gather runtime comparison operands
+    #[cfg(feature = "redqueen")]
+    pub redqueen_breakpoints: Option<HashMap<u64, Vec<RedqueenArguments>>>,
+
+    /// Parsed redqueen breakpoints used to gather runtime comparison operands
+    #[cfg(feature = "redqueen")]
+    pub redqueen_breakpoint_addresses: Option<BTreeSet<u64>>,
+}
+
+/// Copy 4096 bytes of the page at `source` to the page at `dest`
+unsafe fn copy_page(source: u64, dest: u64) {
+    debug_assert!(source & 0xfff == 0, "source addr not a page!");
+    debug_assert!(dest & 0xfff == 0, "dest addr not a page!");
+
+    if cfg!(target_feature = "avx512f") {
+        use std::arch::x86_64::__m512;
+        /// memcpy via avx512 via 4-step unrolling (RRRRWWWW)
+        macro_rules! avx512move_unrolled {
+            ($i:expr) => {
+                let in_addr1 = (source + 64 * ($i * 4 + 0)) as *const __m512;
+                let in_addr2 = (source + 64 * ($i * 4 + 1)) as *const __m512;
+                let in_addr3 = (source + 64 * ($i * 4 + 2)) as *const __m512;
+                let in_addr4 = (source + 64 * ($i * 4 + 3)) as *const __m512;
+                let out_addr1 = (dest + 64 * ($i * 4 + 0)) as *mut __m512;
+                let out_addr2 = (dest + 64 * ($i * 4 + 1)) as *mut __m512;
+                let out_addr3 = (dest + 64 * ($i * 4 + 2)) as *mut __m512;
+                let out_addr4 = (dest + 64 * ($i * 4 + 3)) as *mut __m512;
+                let read_val1 = std::ptr::read_unaligned(in_addr1);
+                let read_val2 = std::ptr::read_unaligned(in_addr2);
+                let read_val3 = std::ptr::read_unaligned(in_addr3);
+                let read_val4 = std::ptr::read_unaligned(in_addr4);
+                std::ptr::write_unaligned(out_addr1, read_val1);
+                std::ptr::write_unaligned(out_addr2, read_val2);
+                std::ptr::write_unaligned(out_addr3, read_val3);
+                std::ptr::write_unaligned(out_addr4, read_val4);
+            };
+        }
+
+        avx512move_unrolled!(0);
+        avx512move_unrolled!(1);
+        avx512move_unrolled!(2);
+        avx512move_unrolled!(3);
+        avx512move_unrolled!(4);
+        avx512move_unrolled!(5);
+        avx512move_unrolled!(6);
+        avx512move_unrolled!(7);
+        avx512move_unrolled!(8);
+        avx512move_unrolled!(9);
+        avx512move_unrolled!(10);
+        avx512move_unrolled!(11);
+        avx512move_unrolled!(12);
+        avx512move_unrolled!(13);
+        avx512move_unrolled!(14);
+        avx512move_unrolled!(15);
+    } else {
+        // Copy the snapshot bytes into the guest memory
+        std::ptr::copy_nonoverlapping(source as *const u8, dest as *mut u8, 0x1000);
+    }
 }
 
 impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
@@ -612,24 +663,27 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         virtualbox_cpu: &VbCpu,
         cpuid: &CpuId,
         snapshot_fd: i32,
-        clean_snapshot: u64,
-        coverage_breakpoints: Option<BTreeMap<VirtAddr, u8>>,
-        reset_breakpoints: Option<BTreeMap<(VirtAddr, Cr3), ResetBreakpointType>>,
-        symbols: &'a Option<VecDeque<Symbol>>,
+        clean_snapshot: Arc<RwLock<Memory>>,
+        coverage_breakpoints: Option<CoverageBreakpoints>,
+        reset_breakpoints: Option<ResetBreakpoints>,
+        symbols: &'a Option<SymbolList>,
         config: Config,
         unwinders: StackUnwinders,
-        #[cfg(feature = "redqueen")] redqueen_rules: BTreeMap<u64, BTreeSet<RedqueenRule>>,
+        #[cfg(feature = "redqueen")] redqueen_breakpoints: Option<
+            HashMap<u64, Vec<RedqueenArguments>>,
+        >,
     ) -> Result<Self> {
+        // Create the IRQ chip to enable the APIC for this VM
+        vm.create_irq_chip().context("Failed to create IRQCHIP")?;
+
         // Create a PIT2 timer
+        // This call is only valid after enabling in-kernel irqchip support via KVM_CREATE_IRQCHIP.
         let pit_config = kvm_pit_config::default();
         vm.create_pit2(pit_config)
             .context(Error::FailedToCreatePIT2)?;
 
         // Set the Task State Segment address to the default TSS base
         vm.set_tss_address(TSS_BASE.try_into()?)?;
-
-        // Create the IRQ chip to enable the APIC for this VM
-        vm.create_irq_chip().context("Failed to create IRQCHIP")?;
 
         // Allocate a CPU for this VM
         let vcpu = vm.create_vcpu(0).context(Error::FailedToCreateVcpu)?;
@@ -663,7 +717,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             .context("Failed to set guest debug mode")?;
 
         // Create the memory backing for the guest VM using the existing snapshot
-        let mem_ptr = crate::create_guest_memory_backing(snapshot_fd)?;
+        let memory = Memory::from_fd(snapshot_fd, config.guest_memory_size)?;
 
         // Sanity check only `syscall_whitelist` or `syscall_blacklist` is set and not
         // both
@@ -684,6 +738,19 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         let exit_on_syscall =
             !fuzzer.syscall_whitelist().is_empty() || !fuzzer.syscall_blacklist().is_empty();
 
+        // Create an set for easily searchable redqueen breakpoint addresses
+        #[cfg(feature = "redqueen")]
+        let mut redqueen_breakpoint_addresses = None;
+
+        #[cfg(feature = "redqueen")]
+        if let Some(ref redqueen_bps) = redqueen_breakpoints {
+            let mut result = BTreeSet::new();
+            for (addr, _) in redqueen_bps.iter() {
+                result.insert(*addr);
+            }
+            redqueen_breakpoint_addresses = Some(result);
+        }
+
         // Create the overall FuzzVm struct
         let mut fuzzvm = Self {
             core_id,
@@ -694,11 +761,11 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             vcpu_events: vcpu.get_vcpu_events()?,
             rng: Rng::new(),
             single_step: false,
-            memory: Memory::from_addr(mem_ptr as u64),
+            memory,
             vm,
             vcpu,
             vbcpu: *virtualbox_cpu,
-            breakpoints: BTreeMap::new(),
+            breakpoints: Breakpoints::default(),
             breakpoint_original_bytes: Vec::new(),
             breakpoint_types: Vec::new(),
             breakpoint_hooks: Vec::new(),
@@ -727,8 +794,13 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             filesystem: None,
             config,
             #[cfg(feature = "redqueen")]
-            redqueen_rules,
+            redqueen_rules: BTreeMap::new(),
+            #[cfg(feature = "redqueen")]
+            redqueen_breakpoints,
+            #[cfg(feature = "redqueen")]
+            redqueen_breakpoint_addresses,
             unwinders: Some(unwinders),
+            core_stats: None,
         };
 
         // Pre-write all of the coverage breakpoints into the memory for the VM. The
@@ -791,10 +863,10 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
             for breakpoint in fuzzer_bps {
                 match breakpoint {
-                    BreakpointLookup::Address(virt_addr, cr3) => {
+                    AddressLookup::Virtual(virt_addr, cr3) => {
                         new_reset_bps.insert((*virt_addr, *cr3), reset_type);
                     }
-                    BreakpointLookup::SymbolOffset(symbol, offset) => {
+                    AddressLookup::SymbolOffset(symbol, offset) => {
                         if let Some((virt_addr, cr3)) = fuzzvm.get_symbol_address(symbol) {
                             new_reset_bps.insert((virt_addr.offset(*offset), cr3), reset_type);
                         } else {
@@ -811,26 +883,29 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                                     log::info!(" - {p}");
                                 }
                             }
-                            return Err(Error::FuzzerBreakpointNotFound(symbol, *offset).into());
+                            return Err(Error::LookupSymbolNotFound(symbol, *offset).into());
                         }
                     }
                 }
             }
         }
 
+        // Add all of the reset/crash breakpoints given by the fuzzer
+        if let Some(ref mut reset_bps) = fuzzvm.reset_breakpoints {
+            reset_bps.extend(&new_reset_bps);
+        }
+
         // Remove all reset breakpoints from the coverage breakpoints if they exist
         // Reset breakpoints take precedence over the coverage breakpoints since they
         // are used to signal resets or crashes
         if let Some(ref mut cov_bps) = fuzzvm.coverage_breakpoints {
-            for (addr, _cr3) in new_reset_bps.keys() {
+            for (addr, _cr3) in fuzzvm.reset_breakpoints.as_ref().unwrap().keys() {
                 cov_bps.remove(addr);
             }
         }
 
-        // Add all of the reset/crash breakpoints given by the fuzzer
-        if let Some(ref mut reset_bps) = fuzzvm.reset_breakpoints {
-            reset_bps.append(&mut new_reset_bps);
-        }
+        // Init the VM based on the given fuzzer (called a single time)
+        fuzzer.init_snapshot(&mut fuzzvm)?;
 
         // Init the VM based on the given fuzzer
         fuzzer.init_vm(&mut fuzzvm)?;
@@ -856,7 +931,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                 cr3,
                 BreakpointType::Repeated,
                 BreakpointMemory::NotDirty,
-                BreakpointHook::Func(|_, _, _| Ok(Execution::Continue)),
+                BreakpointHook::Func(|_, _, _, _| Ok(Execution::Continue)),
             )?;
         }
 
@@ -882,8 +957,9 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         #[allow(clippy::unnecessary_wraps)]
         fn enable_trap_flag<FUZZER: Fuzzer>(
             fuzzvm: &mut FuzzVm<FUZZER>,
-            _input: &FUZZER::Input,
+            _input: &InputWithMetadata<FUZZER::Input>,
             _fuzzer: &mut FUZZER,
+            _feedback: Option<&mut crate::feedback::FeedbackTracker>,
         ) -> Result<Execution> {
             let mut rflags = RFlags::from_bits_truncate(fuzzvm.rflags());
             rflags.insert(RFlags::TRAP_FLAG);
@@ -900,16 +976,38 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         if self.single_step {
             for vector in 0..255 {
                 let addr = self.vbcpu.idtr_base + vector * std::mem::size_of::<IdtEntry>() as u64;
-                let entry = self.read::<IdtEntry>(VirtAddr(addr), self.cr3())?;
-                let isr = entry.isr();
+                let cr3 = self.cr3();
+
+                let entry = self.read::<IdtEntry>(VirtAddr(addr), cr3)?;
+                let isr = VirtAddr(entry.isr());
 
                 self.set_breakpoint(
-                    VirtAddr(isr),
-                    self.cr3(),
+                    isr,
+                    cr3,
                     BreakpointType::Repeated,
                     BreakpointMemory::NotDirty,
                     BreakpointHook::Func(enable_trap_flag),
                 )?;
+
+                // Duplicate the current isr breakpoints with one using the wildcard cr3
+                // to continue execution calling an isr from any cr3 and not just the
+                // cr3 that started the VM
+                let mut curr_index = None;
+                if let Some(index) = self.breakpoints.get(&(isr, cr3)) {
+                    curr_index = Some(*index);
+                    self.breakpoints.insert((isr, WILDCARD_CR3), *index);
+                }
+
+                if let Some(index) = curr_index {
+                    let orig_type = self.breakpoint_types[index];
+                    self.breakpoint_types.push(orig_type);
+
+                    let orig_byte = self.breakpoint_original_bytes[index];
+                    self.breakpoint_original_bytes.push(orig_byte);
+
+                    self.breakpoint_hooks
+                        .push(BreakpointHook::Func(enable_trap_flag));
+                }
             }
         }
 
@@ -1301,6 +1399,26 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
         // Return successs
         Ok(())
+    }
+
+    /// Permanently write the given bytes to the current snapshot and the underlying clean snapshot
+    /// such that these bytes are no longer replaced during a guest reset
+    ///
+    /// # Errors
+    ///
+    /// * If we attempt to write to an unmapped virtual address
+    /// * If we fail to write the bounds to the translated physical address
+    pub fn patch_bytes_permanent(&mut self, lookup: AddressLookup, new_bytes: &[u8]) -> Result<()> {
+        // Get the virtual address from the lookup
+        let (virt_addr, cr3) = lookup.get(self)?;
+
+        // Grab the WRITE lock for the clean snapshot since we are modifying the clean snapshot
+        let mut clean_snapshot = self.clean_snapshot.write().unwrap();
+        clean_snapshot.write_bytes(virt_addr, cr3, new_bytes)?;
+        drop(clean_snapshot);
+
+        // Patch the bytes of the current memory
+        self.write_bytes(virt_addr, cr3, new_bytes)
     }
 
     /// Translate the given guest [`VirtAddr`] using the given page table found at
@@ -2082,7 +2200,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         }
         */
 
-        print!("{:-^120}\n", " INSTRUCTION ".blue());
+        println!("{:-^120}", " INSTRUCTION ".blue());
         let mut rip_symbol = String::new();
         let curr_symbol = self.get_symbol(self.rip());
         rip_symbol.push_str(&curr_symbol.unwrap_or_else(|| "UnknownSym".to_string()));
@@ -2095,7 +2213,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
         // Attempt read variable length stacks. Repeat trying to read decreasing amounts
         // of stack values until we can read them all
-        print!("{:-^120}\n", " STACK ".blue());
+        println!("{:-^120}", " STACK ".blue());
         let mut found = false;
         for size in (0..0x14).rev() {
             let mut bytes = vec![0_u64; size];
@@ -2104,8 +2222,8 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                 .is_ok()
             {
                 for (offset, val) in bytes.iter().enumerate() {
-                    print!(
-                        "+{:#04x}|{:#x}: ({:#018x}) {}\n",
+                    println!(
+                        "+{:#04x}|{:#x}: ({:#018x}) {}",
                         offset * STACK_TYPE_SIZE,
                         self.regs().rsp + (offset * STACK_TYPE_SIZE) as u64,
                         *val,
@@ -2160,6 +2278,11 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         self.symbols
             .as_ref()
             .and_then(|sym_data| crate::symbols::get_symbol(addr, sym_data))
+    }
+
+    /// Check if there is a breakpoint registered for a given address/cr3.
+    pub fn has_breakpoint(&mut self, virt_addr: VirtAddr, cr3: Cr3) -> bool {
+        self.breakpoints.contains_key(&(virt_addr, cr3))
     }
 
     /// Set a breakpoint at the given [`VirtAddr`] using [`Cr3`] as the page table,
@@ -2234,7 +2357,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
     /// Check for the given `subsymbol` in the current symbol list using the current
     /// `Cr3`. This is mostly used as a helper function for
-    /// `FuzzVm::apply_fuzzer_breakpoints`.
+    /// [`FuzzVm::apply_fuzzer_breakpoints`.]
     ///
     /// # Example
     ///
@@ -2331,8 +2454,11 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     pub fn handle_breakpoint(
         &mut self,
         fuzzer: &mut FUZZER,
-        input: &FUZZER::Input,
+        input: &InputWithMetadata<FUZZER::Input>,
+        feedback: Option<&mut FeedbackTracker>,
     ) -> Result<Execution> {
+        let _timer = self.scoped_timer(PerfMark::HandleBreakpoint);
+
         // Get the current address
         let (virt_addr, cr3) = self.current_address();
 
@@ -2423,7 +2549,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             // Fuzzer is not handling the syscall, execute the syscall as normal
             let bp_index = self
                 .breakpoints
-                .get(&(virt_addr, cr3))
+                .get(&(virt_addr, Cr3(self.vbcpu.cr3)))
                 .expect("Failed to find LSTAR breakpoint");
 
             let orig_byte = self
@@ -2444,32 +2570,51 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
         // The fuzzer is not handling a syscall breakpoint, check if any other
         // breakpoints are being handled
-        if let Some(bp_index) = self.breakpoints.get(&(virt_addr, cr3)) {
+        //
+        // Try the breakpoint address with the current cr3. If that fails, then try the wildcard cr3
+
+        let curr_bp = {
+            let _timer = self.scoped_timer(PerfMark::HandleBp1);
+            self.breakpoints
+                .get(&(virt_addr, cr3))
+                .or(self.breakpoints.get(&(virt_addr, WILDCARD_CR3)))
+        };
+
+        if let Some(bp_index) = curr_bp {
             let bp_index = *bp_index;
 
             // We have this breakpoint in our database attempt to handle it
-            let bp_type = self
-                .breakpoint_types
-                .get(bp_index)
-                .ok_or(Error::InvalidBreakpointIndex)?;
+            let bp_type = {
+                let _timer = self.scoped_timer(PerfMark::HandleBp2);
+                self.breakpoint_types
+                    .get(bp_index)
+                    .ok_or(Error::InvalidBreakpointIndex)?
+            };
 
-            let orig_byte = self
-                .breakpoint_original_bytes
-                .get(bp_index)
-                .ok_or(Error::InvalidBreakpointIndex)?
-                .ok_or(Error::ExternalBreakpoint)?;
+            let orig_byte = {
+                let _timer = self.scoped_timer(PerfMark::HandleBp3);
+
+                self.breakpoint_original_bytes
+                    .get(bp_index)
+                    .ok_or(Error::InvalidBreakpointIndex)?
+                    .ok_or(Error::ExternalBreakpoint)?
+            };
 
             // Explanation of write back based on breakpoint type:
             //
             // Hooks      - Callback function assumes the hook breakpoints is always there
             // Repeated   - This is reset after the next instruction is executed
             // SingleShot - This should always be replaced
-            write_back = match bp_type {
-                BreakpointType::Hook => None,
-                BreakpointType::SingleShot | BreakpointType::Repeated => {
-                    Some((virt_addr, cr3, orig_byte))
-                }
-            };
+            {
+                let _timer = self.scoped_timer(PerfMark::HandleBp4);
+
+                write_back = match bp_type {
+                    BreakpointType::Hook => None,
+                    BreakpointType::SingleShot | BreakpointType::Repeated => {
+                        Some((virt_addr, cr3, orig_byte))
+                    }
+                };
+            }
 
             // If the breakpoint is to be repeated, notate the `restore_breakpoint`
             // flag to signal that the next instruction should single stepped and
@@ -2480,20 +2625,43 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
             // If we found an original byte to overwrite, write the byte back now that we
             // have released the immutable ref from `self.breakpoints`
-            if let Some((virt_addr, cr3, byte)) = write_back {
-                self.write_bytes(virt_addr, cr3, &[byte])?;
+            {
+                let _timer = self.scoped_timer(PerfMark::HandleBp5);
+
+                if let Some((virt_addr, cr3, byte)) = write_back {
+                    self.write_bytes(virt_addr, cr3, &[byte])?;
+                }
             }
 
+            let hook = {
+                let _timer = self.scoped_timer(PerfMark::HandleBp6);
+
+                self.breakpoint_hooks
+                    .get(bp_index)
+                    .ok_or(Error::InvalidBreakpointIndex)?
+            };
+
             // Let the fuzzer handle the breakpoint
-            if let BreakpointHook::Func(bp_func) = self
-                .breakpoint_hooks
-                .get(bp_index)
-                .ok_or(Error::InvalidBreakpointIndex)?
-            {
-                execution = bp_func(self, input, fuzzer)?;
-            } else {
-                let sym = self.get_symbol(virt_addr.0);
-                return Err(Error::BreakpointHookNotSet(virt_addr, sym).into());
+            match hook {
+                BreakpointHook::Func(bp_func) => {
+                    execution = bp_func(self, input, fuzzer, feedback)?;
+                }
+                #[cfg(feature = "redqueen")]
+                BreakpointHook::Redqueen(args) => {
+                    let args = args.clone();
+                    for arg in args {
+                        crate::cmp_analysis::gather_comparison(self, input, &arg)?;
+                    }
+
+                    execution = Execution::Continue;
+                }
+                BreakpointHook::Ignore => {
+                    execution = Execution::Continue;
+                }
+                _ => {
+                    let sym = self.get_symbol(virt_addr.0);
+                    return Err(Error::BreakpointHookNotSet(virt_addr, sym).into());
+                }
             }
         } else {
             return Err(Error::UnknownBreakpoint(virt_addr, cr3).into());
@@ -2506,6 +2674,8 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     /// manually using a function such as [`FuzzVm::write_bytes_dirty`]. Returns the
     /// total number of restored pages.
     fn restore_dirty_pages(&mut self) -> u32 {
+        let _timer = self.scoped_timer(PerfMark::RestoreDirtyPages);
+
         // Reset the scratch reset buffer
         self.scratch_reset_buffer.clear();
 
@@ -2537,63 +2707,16 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             }
         }
 
+        // Grab the READ lock for the clean snapshot
+        let clean_snapshot = self.clean_snapshot.read().unwrap();
+
         // Reset the pages currently in the scratch reset buffer
         for curr_phys_addr in &self.scratch_reset_buffer {
             // Calculate the address into the memory and snapshot pages
             let memory_addr = self.memory.backing() + curr_phys_addr;
-            let snapshot_addr = self.clean_snapshot + curr_phys_addr;
+            let snapshot_addr = clean_snapshot.backing() + curr_phys_addr;
 
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    snapshot_addr as *const u8,
-                    memory_addr as *mut u8,
-                    0x1000,
-                );
-            }
-
-            /*
-            /// memcpy via avx512 via 4-step unrolling (RRRRWWWW)
-            macro_rules! avx512move_unrolled {
-                ($i:expr) => {
-                    let in_addr1  = (snapshot_addr + 64 * ($i * 4 + 0)) as *const __m512;
-                    let in_addr2  = (snapshot_addr + 64 * ($i * 4 + 1)) as *const __m512;
-                    let in_addr3  = (snapshot_addr + 64 * ($i * 4 + 2)) as *const __m512;
-                    let in_addr4  = (snapshot_addr + 64 * ($i * 4 + 3)) as *const __m512;
-                    let out_addr1 = (memory_addr   + 64 * ($i * 4 + 0)) as *mut   __m512;
-                    let out_addr2 = (memory_addr   + 64 * ($i * 4 + 1)) as *mut   __m512;
-                    let out_addr3 = (memory_addr   + 64 * ($i * 4 + 2)) as *mut   __m512;
-                    let out_addr4 = (memory_addr   + 64 * ($i * 4 + 3)) as *mut   __m512;
-                    unsafe {
-                        let read_val1 = std::ptr::read_unaligned(in_addr1);
-                        let read_val2 = std::ptr::read_unaligned(in_addr2);
-                        let read_val3 = std::ptr::read_unaligned(in_addr3);
-                        let read_val4 = std::ptr::read_unaligned(in_addr4);
-                        std::ptr::write_unaligned(out_addr1, read_val1);
-                        std::ptr::write_unaligned(out_addr2, read_val2);
-                        std::ptr::write_unaligned(out_addr3, read_val3);
-                        std::ptr::write_unaligned(out_addr4, read_val4);
-                    }
-                }
-            }
-
-            // Copy the snapshot bytes into the guest memory
-            avx512move_unrolled!(0);
-            avx512move_unrolled!(1);
-            avx512move_unrolled!(2);
-            avx512move_unrolled!(3);
-            avx512move_unrolled!(4);
-            avx512move_unrolled!(5);
-            avx512move_unrolled!(6);
-            avx512move_unrolled!(7);
-            avx512move_unrolled!(8);
-            avx512move_unrolled!(9);
-            avx512move_unrolled!(10);
-            avx512move_unrolled!(11);
-            avx512move_unrolled!(12);
-            avx512move_unrolled!(13);
-            avx512move_unrolled!(14);
-            avx512move_unrolled!(15);
-            */
+            unsafe { copy_page(snapshot_addr, memory_addr) };
         }
 
         try_u32!(self.scratch_reset_buffer.len())
@@ -2606,8 +2729,11 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     ///
     /// * Fails to register guest memory
     fn init_guest_memory_backing(&mut self) -> Result<()> {
-        self.memory_regions =
-            crate::register_guest_memory(self.vm, self.memory.backing() as *mut libc::c_void)?;
+        self.memory_regions = crate::register_guest_memory(
+            self.vm,
+            self.memory.backing() as *mut libc::c_void,
+            self.memory.size(),
+        )?;
 
         // Setup the dirty bitmaps for each memory region
         for (slot, mem_region) in self.memory_regions.iter().enumerate() {
@@ -2632,15 +2758,6 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
             // Create the dirty bitmap for this core for this slot
             self.dirty_bitmaps[slot] = vec![0; bitmap_size];
-
-            // Store the pointer for this bitmap in the densely packed bitmap storage
-            let core_id = try_usize!(self.core_id);
-
-            DIRTY_BITMAPS[core_id][slot].store(
-                self.dirty_bitmaps[slot].as_mut_ptr().cast::<libc::c_void>(),
-                Ordering::SeqCst,
-            );
-
             self.number_of_pages[slot] = try_u32!(memory_size / page_size);
         }
 
@@ -3001,6 +3118,8 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
     /// Apply the reset breakpoints to the VM
     fn apply_reset_breakpoints(&mut self) -> Result<()> {
+        let _timer = self.scoped_timer(PerfMark::ApplyResetBreakpoints);
+
         let reset_breakpoints = self.reset_breakpoints.take();
 
         if let Some(ref reset_bps) = reset_breakpoints {
@@ -3034,6 +3153,8 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     /// Apply the breakpoints from a [`Fuzzer`] to the VM. This will cache the original
     /// byte where the breakpoint
     fn apply_fuzzer_breakpoints(&mut self, fuzzer: &FUZZER) -> Result<()> {
+        let _timer = self.scoped_timer(PerfMark::ApplyFuzzerBreakpoints);
+
         // Use the fuzzer breakpoint cache if it has already been initialized
         if let Some(bps) = self.fuzzer_breakpoint_cache.take() {
             for (virt_addr, cr3, bp_type, bp_hook) in &bps {
@@ -3078,10 +3199,10 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             } in bps
             {
                 match lookup {
-                    BreakpointLookup::Address(virt_addr, cr3) => {
+                    AddressLookup::Virtual(virt_addr, cr3) => {
                         cache.push((*virt_addr, *cr3, *bp_type, *bp_hook));
                     }
-                    BreakpointLookup::SymbolOffset(symbol, offset) => {
+                    AddressLookup::SymbolOffset(symbol, offset) => {
                         if let Some((virt_addr, cr3)) = self.get_symbol_address(symbol) {
                             cache.push((virt_addr.offset(*offset), cr3, *bp_type, *bp_hook));
                         } else {
@@ -3097,7 +3218,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                                 }
                             }
 
-                            return Err(Error::FuzzerBreakpointNotFound(symbol, *offset).into());
+                            return Err(Error::LookupSymbolNotFound(symbol, *offset).into());
                         }
                     }
                 }
@@ -3107,7 +3228,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         // Apply the newly generated cache (should only execute once)
         for (virt_addr, cr3, bp_type, bp_hook) in &cache {
             if self.core_id == 1 {
-                log::info!(
+                log::debug!(
                     "Setting fuzzer breakpoint: {virt_addr:x?} {:?}",
                     self.get_symbol(**virt_addr)
                 );
@@ -3144,35 +3265,26 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
     /// Apply the Redqueen breakpoints from a [`Fuzzer`] to the VM. Additionally
     #[cfg(feature = "redqueen")]
-    pub fn apply_redqueen_breakpoints(&mut self, fuzzer: &FUZZER) -> Result<()> {
+    pub fn apply_redqueen_breakpoints(&mut self) -> Result<()> {
+        let _timer = self.scoped_timer(PerfMark::ApplyRedqueenBreakpoints);
+
         let mut bps_set = 0;
 
         let start = std::time::Instant::now();
 
-        if let Some(bps) = fuzzer.redqueen_breakpoints() {
-            for Breakpoint {
-                lookup,
-                bp_type,
-                bp_hook,
-            } in bps
-            {
-                match lookup {
-                    BreakpointLookup::Address(virt_addr, cr3) => {
-                        self.set_breakpoint(
-                            *virt_addr,
-                            *cr3,
-                            *bp_type,
-                            BreakpointMemory::Dirty,
-                            BreakpointHook::Func(*bp_hook),
-                        )?;
-
-                        bps_set += 1;
-                    }
-                    BreakpointLookup::SymbolOffset(_symbol, _offset) => {
-                        return Err(Error::SymbolBreakpointsNotImplForRedqueen.into());
-                    }
-                }
+        if let Some(redqueen_bps) = self.redqueen_breakpoints.take() {
+            for (addr, args) in &redqueen_bps {
+                self.set_breakpoint(
+                    VirtAddr(*addr),
+                    self.cr3(),
+                    BreakpointType::Repeated,
+                    BreakpointMemory::Dirty,
+                    BreakpointHook::Redqueen(args.clone()),
+                )?;
             }
+
+            bps_set = redqueen_bps.len() as u32;
+            self.redqueen_breakpoints = Some(redqueen_bps);
         }
 
         log::debug!(
@@ -3234,35 +3346,21 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     /// # Errors
     ///
     /// * If the snapshot MSRs fail to be set by KVM
-    pub fn init_guest(&mut self) -> Result<InitGuestPerf> {
-        let mut perf = InitGuestPerf::default();
+    pub fn init_guest(&mut self) -> Result<()> {
+        let _timer = self.scoped_timer(PerfMark::InitGuest);
 
-        /// Helper macro to time the individual components of resetting the guest state
-        macro_rules! time {
-            ($marker:ident, $expr:expr) => {{
-                // Init the timer
-                let start = rdtsc();
-
-                // Execute the given expression
-                $expr;
-
-                // Calculate the time took to execute $expr
-                perf.$marker = rdtsc() - start;
-            }};
-        }
-
-        time!(regs, self.restore_guest_regs());
-        time!(sregs, self.restore_guest_sregs()?);
-        time!(fpu, self.restore_guest_fpu()?);
-        time!(msrs, self.restore_guest_msrs()?);
-        time!(debug_regs, self.restore_guest_debug_regs()?);
+        self.restore_guest_regs();
+        self.restore_guest_sregs()?;
+        self.restore_guest_fpu()?;
+        self.restore_guest_msrs()?;
+        self.restore_guest_debug_regs()?;
 
         self.vcpu.sync_regs_mut().sregs = self.sregs;
         self.vcpu.set_sync_dirty_reg(SyncReg::SystemRegister);
 
         self.dirtied_registers = true;
 
-        Ok(perf)
+        Ok(())
     }
 
     /// Reset the guest state back to the original snapshot and return the performance
@@ -3271,47 +3369,37 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     /// # Errors
     ///
     /// * If the snapshot MSRs fail to be set by KVM
-    pub fn reset_guest_state(&mut self, fuzzer: &mut FUZZER) -> Result<GuestResetPerf> {
-        let mut perf = GuestResetPerf::default();
-
-        /// Helper macro to time the individual components of resetting the guest state
-        macro_rules! time {
-            ($marker:ident, $expr:expr) => {{
-                // Init the timer
-                let start = rdtsc();
-
-                // Execute the given expression
-                let res = $expr;
-
-                // Calculate the time took to execute $expr
-                perf.$marker = rdtsc() - start;
-
-                res
-            }};
-        }
+    pub fn reset_guest_state(&mut self, fuzzer: &mut FUZZER) -> Result<()> {
+        let _timer = self.scoped_timer(PerfMark::ResetGuestState);
 
         // Get the dirty log for all memory regions
-        time!(get_dirty_logs, self.get_dirty_logs()?);
+        self.get_dirty_logs()?;
 
         // Always just restore the dirty pages
-        perf.restored_pages = time!(reset_guest_memory_restore, self.restore_dirty_pages());
+        let kvm_dirty_pages = self.restore_dirty_pages();
 
         // Reset the guest memory and get the number of pages restored
-        perf.restored_pages += time!(reset_guest_memory_custom, unsafe {
-            self.reset_custom_guest_memory()?
-        });
+        let custom_dirty_pages = unsafe { self.reset_custom_guest_memory()? };
 
-        time!(reset_guest_memory_clear, {
-            // Clear the dirty logs
-            self.clear_dirty_logs()
-                .context("Failed to clear dirty logs")?;
+        // If we have stats, increase the dirty page count
+        {
+            let _timer = self.scoped_timer(PerfMark::AddDirtyPages);
 
-            // Reset the custom dirty list
-            self.memory.dirty_pages.clear();
-        });
+            if let Some(stats) = self.core_stats.as_mut() {
+                stats.lock().unwrap().dirty_pages_kvm += kvm_dirty_pages as u64;
+                stats.lock().unwrap().dirty_pages_custom += custom_dirty_pages as u64;
+            }
+        }
+
+        // Clear the dirty logs
+        self.clear_dirty_logs()
+            .context("Failed to clear dirty logs")?;
+
+        // Reset the custom dirty list
+        self.memory.dirty_pages.clear();
 
         // Reset the guest back to the original snapshot
-        perf.init_guest = self.init_guest()?;
+        self.init_guest()?;
 
         // Reset the internal breakpoint state
         //
@@ -3324,19 +3412,21 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         self.restore_breakpoint = None;
 
         // Init the VM based on the given fuzzer
-        time!(init_vm, fuzzer.init_vm(self)?);
+        {
+            let _timer = self.scoped_timer(PerfMark::FuzzerInitVm);
+            fuzzer.init_vm(self)?;
+        }
 
         // Apply the breakpoints for the fuzzer
-        time!(
-            apply_fuzzer_breakpoints,
-            self.apply_fuzzer_breakpoints(fuzzer)?
-        );
+        self.apply_fuzzer_breakpoints(fuzzer)?;
 
         // Apply the coverage breakpoints for the fuzzer
-        time!(apply_reset_breakpoints, self.apply_reset_breakpoints()?);
+        self.apply_reset_breakpoints()?;
 
         // Reset the retired instructions counter
         // self.reset_retired_instructions()?;
+
+        let _timer = self.scoped_timer(PerfMark::RemainingResetGuest);
 
         // Reset the start time for the next fuzz case used for determining timeout
         self.start_time = Instant::now();
@@ -3356,8 +3446,8 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                 self.cr3(),
                 BreakpointType::Repeated,
                 BreakpointMemory::NotDirty,
-                BreakpointHook::Func(|_, _, _| {
-                    println!("Hit LSTAR breakpoint!");
+                BreakpointHook::Func(|_, _, _, _| {
+                    log::warn!("Hit LSTAR breakpoint!");
                     Ok(Execution::Continue)
                 }),
             )?;
@@ -3372,7 +3462,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         self.filesystem = Some(filesystem);
 
         // Return the guest reset perf
-        Ok(perf)
+        Ok(())
     }
 
     /// Reset the guest memory pages and returns the number of dirty pages reset
@@ -3389,61 +3479,18 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     ///
     /// * Unsafe due to the avx512 4KiB memcpy
     pub unsafe fn reset_custom_guest_memory(&mut self) -> Result<u32> {
-        use std::arch::x86_64::__m512;
+        let _timer = self.scoped_timer(PerfMark::RestoreCustomGuestMemory);
+
+        // Grab the READ lock for the clean snapshot
+        let clean_snapshot = self.clean_snapshot.read().unwrap();
 
         // Restore the pages that were written to by us
         for custom_dirty_page in &self.memory.dirty_pages {
             // Calculate the address into the memory and snapshot pages
             let memory_addr = self.memory.backing() + custom_dirty_page.0;
-            let snapshot_addr = self.clean_snapshot + custom_dirty_page.0;
+            let snapshot_addr = clean_snapshot.backing() + custom_dirty_page.0;
 
-            if cfg!(target_feature = "avx512f") {
-                /// memcpy via avx512 via 4-step unrolling (RRRRWWWW)
-                macro_rules! avx512move_unrolled {
-                    ($i:expr) => {
-                        let in_addr1 = (snapshot_addr + 64 * ($i * 4 + 0)) as *const __m512;
-                        let in_addr2 = (snapshot_addr + 64 * ($i * 4 + 1)) as *const __m512;
-                        let in_addr3 = (snapshot_addr + 64 * ($i * 4 + 2)) as *const __m512;
-                        let in_addr4 = (snapshot_addr + 64 * ($i * 4 + 3)) as *const __m512;
-                        let out_addr1 = (memory_addr + 64 * ($i * 4 + 0)) as *mut __m512;
-                        let out_addr2 = (memory_addr + 64 * ($i * 4 + 1)) as *mut __m512;
-                        let out_addr3 = (memory_addr + 64 * ($i * 4 + 2)) as *mut __m512;
-                        let out_addr4 = (memory_addr + 64 * ($i * 4 + 3)) as *mut __m512;
-                        let read_val1 = std::ptr::read_unaligned(in_addr1);
-                        let read_val2 = std::ptr::read_unaligned(in_addr2);
-                        let read_val3 = std::ptr::read_unaligned(in_addr3);
-                        let read_val4 = std::ptr::read_unaligned(in_addr4);
-                        std::ptr::write_unaligned(out_addr1, read_val1);
-                        std::ptr::write_unaligned(out_addr2, read_val2);
-                        std::ptr::write_unaligned(out_addr3, read_val3);
-                        std::ptr::write_unaligned(out_addr4, read_val4);
-                    };
-                }
-
-                avx512move_unrolled!(0);
-                avx512move_unrolled!(1);
-                avx512move_unrolled!(2);
-                avx512move_unrolled!(3);
-                avx512move_unrolled!(4);
-                avx512move_unrolled!(5);
-                avx512move_unrolled!(6);
-                avx512move_unrolled!(7);
-                avx512move_unrolled!(8);
-                avx512move_unrolled!(9);
-                avx512move_unrolled!(10);
-                avx512move_unrolled!(11);
-                avx512move_unrolled!(12);
-                avx512move_unrolled!(13);
-                avx512move_unrolled!(14);
-                avx512move_unrolled!(15);
-            } else {
-                // Copy the snapshot bytes into the guest memory
-                std::ptr::copy_nonoverlapping(
-                    snapshot_addr as *const u8,
-                    memory_addr as *mut u8,
-                    0x1000,
-                );
-            }
+            unsafe { copy_page(snapshot_addr, memory_addr) };
         }
 
         // Add the fuzzer custom dirty pages to the number of pages restored
@@ -3752,9 +3799,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
     /// Pass execution to the VM. Returns the `FuzzVmExit` along with the number of
     /// cycles in the KVM VM itself.
-    pub fn run(&mut self, perf: &mut VmRunPerf) -> Result<FuzzVmExit> {
-        let start = rdtsc();
-
+    pub fn run(&mut self) -> Result<FuzzVmExit> {
         let mut rflags = RFlags::from_bits_truncate(self.regs.rflags);
 
         // Enable TRAP flag if guest is single stepping
@@ -3786,21 +3831,17 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         self.vcpu.set_sync_valid_reg(SyncReg::VcpuEvents);
 
         // Restore the FPU
-        // self.vcpu.set_fpu(&self.vcpu.get_fpu()?)?;
-
-        // Accumulate the cyles spent before the VM run call
-        perf.pre_run_vm = rdtsc() - start;
-
-        // Init the timer for the run() call
-        let start = rdtsc();
+        // self.vcpu.set_fpu(&self.fpu);
 
         // Execute the CPU
-        let test_res = self.vcpu.run();
+        let test_res = {
+            let _timer = self.scoped_timer(PerfMark::InVm);
+            self.vcpu.run()
+        };
 
-        perf.in_vm = rdtsc() - start;
+        // self.fpu = self.vcpu.get_fpu()?;
 
-        // Init the timer for the remainder of the function
-        let start = rdtsc();
+        let _timer = self.scoped_timer(PerfMark::PostRunVm);
 
         // Unset the dirtied_registers bit for this round of handling the exit
         self.dirtied_registers = false;
@@ -3816,7 +3857,6 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                     crate::KICK_CORES.store(true, std::sync::atomic::Ordering::SeqCst);
                     FuzzVmExit::BadAddress(self.rip())
                 } else {
-                    perf.post_run_vm = rdtsc() - start;
                     let errno = e.errno();
                     println!("ERROR FROM RUN: {e:?} {errno}");
                     return Err(Error::FailedToExecuteVm(e).into());
@@ -3848,51 +3888,71 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         self.sregs = self.vcpu.sync_regs().sregs;
         self.vcpu_events = self.vcpu.sync_regs().events;
 
+        // Get the current byte before attempting to restore it
+        let virt_addr = VirtAddr(self.rip());
+        let cr3 = Cr3(self.vbcpu.cr3);
+        let curr_byte = self.read::<u8>(virt_addr, cr3);
+
         // If `restore_breakpoint` has been set before the instruction, it symbolizes a
         // breakpoint should be restored at that location.
         let possible_restore_breakpoint = self.restore_breakpoint.take();
         if let Some((virt_addr, cr3)) = possible_restore_breakpoint {
-            self.write_bytes(virt_addr, cr3, &[0xcc])?;
+            if virt_addr == VirtAddr(self.rip()) {
+                // Only write bytes if the next executed instruction isn't the instruction to restore.
+                // This can occur due to the watchdog timer elapsing.
+                self.restore_breakpoint = Some((virt_addr, cr3));
+            } else {
+                self.write_bytes(virt_addr, cr3, &[0xcc])?;
+            }
         }
 
         // Custom handling of VMEXITs
         match res {
             FuzzVmExit::Breakpoint(_) | FuzzVmExit::DebugException => {
+                let _timer = self.scoped_timer(PerfMark::PostRunVmBp);
+
                 // Check if the breakpoint VmExit was caused by a coverage breakpoint
                 let rip = self.regs().rip;
 
                 if let Some(ref cov_bps) = self.coverage_breakpoints {
-                    // If the current address can be removed from the coverage database, then
-                    // we have hit a new coverage address. Return a CoverageBreakpoint exit.
-                    let virt_addr = VirtAddr(rip);
-                    let mut clean_mem = Memory::from_addr(self.clean_snapshot);
+                    let _timer = self.scoped_timer(PerfMark::PostRunVmCovBp);
 
-                    if let Some(orig_byte) = cov_bps.get(&virt_addr) {
-                        // This breakpoint is a coverage breakpoint. Restore the VM
-                        // memory and the global clean memory of this breakpoint so no
-                        // other VM has to cover this breakpoint either
-                        let orig_byte = *orig_byte;
-                        let cr3 = Cr3(self.vbcpu.cr3);
-                        clean_mem.write_bytes(virt_addr, cr3, &[orig_byte])?;
-                        self.write_bytes(virt_addr, cr3, &[orig_byte])?;
+                    if matches!(curr_byte, Ok(0xcc)) || self.single_step {
+                        // If the current address can be removed from the coverage database, then
+                        // we have hit a new coverage address. Return a CoverageBreakpoint exit.
 
-                        perf.post_run_vm = rdtsc() - start;
-                        return Ok(FuzzVmExit::CoverageBreakpoint(rip));
+                        if let Some(orig_byte) = cov_bps.get(&virt_addr) {
+                            assert!(*orig_byte != 0xcc);
+                            // This breakpoint is a coverage breakpoint. Restore the VM
+                            // memory and the global clean memory of this breakpoint so no
+                            // other VM has to cover this breakpoint either
+                            let orig_byte = *orig_byte;
+
+                            // Grab the WRITE lock for the clean snapshot since we are modifying
+                            // the clean snapshot
+                            let mut clean_snapshot = self.clean_snapshot.write().unwrap();
+                            clean_snapshot.write_bytes(virt_addr, cr3, &[orig_byte])?;
+                            drop(clean_snapshot);
+
+                            self.write_bytes(virt_addr, cr3, &[orig_byte])?;
+
+                            return Ok(FuzzVmExit::CoverageBreakpoint(rip));
+                        }
                     }
                 }
 
-                if let Some(reset_bps) = self.reset_breakpoints.take() {
+                if let Some(mut reset_bps) = self.reset_breakpoints.take() {
+                    let _timer = self.scoped_timer(PerfMark::PostRunVmResetBp);
+
                     for cr3 in [self.cr3(), WILDCARD_CR3] {
                         if let Some(reset_bp_type) = reset_bps.get(&(VirtAddr(rip), cr3)) {
                             let vmexit = match *reset_bp_type {
                                 ResetBreakpointType::Reset => {
-                                    perf.post_run_vm = rdtsc() - start;
                                     Some(FuzzVmExit::ResetBreakpoint(rip))
                                 }
                                 ResetBreakpointType::Crash
                                 | ResetBreakpointType::ReportGenericError
                                 | ResetBreakpointType::ReportOutOfMemory => {
-                                    perf.post_run_vm = rdtsc() - start;
                                     Some(FuzzVmExit::CrashBreakpoint(rip))
                                 }
                                 ResetBreakpointType::HandleInvalidOp => {
@@ -3912,13 +3972,11 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                                         self.read_bytes(ip, self.cr3(), &mut bytes)?;
                                         None
                                     } else {
-                                        perf.post_run_vm = rdtsc() - start;
                                         Some(FuzzVmExit::Debug(Exception::InvalidOpcode))
                                     }
                                 }
                                 ResetBreakpointType::ForceSigFault => {
                                     let signal = self.forced_signal()?;
-                                    perf.post_run_vm = rdtsc() - start;
 
                                     // Special case the trap signal for display in the TUI
                                     if matches!(signal, Signal::Trap) {
@@ -3945,7 +4003,6 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                                     // Return success
                                     self.set_rax(0);
 
-                                    perf.post_run_vm = rdtsc() - start;
                                     Some(FuzzVmExit::FindModuleNameAndOffset)
                                 }
                                 ResetBreakpointType::ConsoleWrite => {
@@ -3974,8 +4031,6 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                                         self.get_symbol(self.rip()));
                                     */
 
-                                    perf.post_run_vm = rdtsc() - start;
-                                    // return Ok((FuzzVmExit::ConsoleWrite, perf));
                                     Some(FuzzVmExit::Hlt)
                                 }
                                 ResetBreakpointType::LogStore => {
@@ -3994,20 +4049,34 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                                     // Immediately return from the function
                                     self.fake_immediate_return()?;
 
-                                    perf.post_run_vm = rdtsc() - start;
                                     Some(FuzzVmExit::LogStore)
                                 }
                                 ResetBreakpointType::ImmediateReturn => {
+                                    let _timer = self.scoped_timer(PerfMark::ResetImmediateReturn);
+
+                                    // Patch the immediate return locations
+                                    self.patch_bytes_permanent(
+                                        AddressLookup::Virtual(VirtAddr(self.rip()), self.cr3()),
+                                        &[0xc3],
+                                    )?;
+
+                                    if reset_bps
+                                        .remove_entry(&(VirtAddr(self.rip()), self.cr3()))
+                                        .is_none()
+                                    {
+                                        panic!(
+                                            "reset bps doesn't have the immediate return value?!"
+                                        );
+                                    }
+
                                     // Immediately return from the function
                                     self.fake_immediate_return()?;
 
-                                    perf.post_run_vm = rdtsc() - start;
                                     Some(FuzzVmExit::ImmediateReturn)
                                 }
                                 ResetBreakpointType::KernelDie => {
                                     // self.print_context();
 
-                                    perf.post_run_vm = rdtsc() - start;
                                     Some(FuzzVmExit::KernelDieBreakpoint)
                                 }
                                 ResetBreakpointType::KasanReport => {
@@ -4036,8 +4105,6 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
 
                                     // log::info!("{}", self.console_output);
 
-                                    perf.post_run_vm = rdtsc() - start;
-
                                     if is_write {
                                         Some(FuzzVmExit::KasanWrite { ip, size, addr })
                                     } else {
@@ -4065,7 +4132,6 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             _ => {}
         }
 
-        perf.post_run_vm = rdtsc() - start;
         Ok(res)
     }
 
@@ -4073,13 +4139,10 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     pub fn run_until_reset(
         &mut self,
         fuzzer: &mut FUZZER,
-        input: &FUZZER::Input,
+        input: &InputWithMetadata<FUZZER::Input>,
         vm_timeout: Duration,
-    ) -> Result<(Execution, VmRunPerf)> {
+    ) -> Result<Execution> {
         let mut execution = Execution::Continue;
-
-        // Initialize the performance counters for executing a VM
-        let mut perf = crate::fuzzvm::VmRunPerf::default();
 
         // Top of the run iteration loop for the current fuzz case
         loop {
@@ -4089,10 +4152,10 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             }
 
             // Execute the VM
-            let ret = self.run(&mut perf)?;
+            let ret = self.run()?;
 
             // Handle the FuzzVmExit to determine
-            let ret = handle_vmexit(&ret, self, fuzzer, None, input);
+            let ret = handle_vmexit(&ret, self, fuzzer, None, input, None);
             execution = match ret {
                 Err(e) => {
                     return Err(e);
@@ -4105,7 +4168,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             // apply fuzzer specific breakpoint logic. We can ignore the "unknown breakpoint"
             // error that is thrown if a breakpoint is not found;
             if self.single_step {
-                if let Ok(new_execution) = self.handle_breakpoint(fuzzer, input) {
+                if let Ok(new_execution) = self.handle_breakpoint(fuzzer, input, None) {
                     execution = new_execution;
                 } else {
                     // Ignore the unknown breakpoint case since we check every instruction due to
@@ -4120,7 +4183,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             }
         }
 
-        Ok((execution, perf))
+        Ok(execution)
     }
 
     /// Execute the [`FuzzVm`] until a reset or timeout event occurs.
@@ -4134,17 +4197,16 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     fn run_until_reset_redqueen(
         &mut self,
         fuzzer: &mut FUZZER,
-        input: &FUZZER::Input,
+        input: &InputWithMetadata<FUZZER::Input>,
         vm_timeout: Duration,
-        coverage: &mut BTreeSet<VirtAddr>,
-    ) -> Result<BTreeSet<(VirtAddr, RFlags)>> {
+        feedback: &mut FeedbackTracker,
+    ) -> Result<()> {
+        let _timer = self.scoped_timer(PerfMark::RunUntilResetRedqueen);
+
         let mut execution = Execution::Continue;
 
-        // Initialize the performance counters for executing a VM
-        let mut perf = crate::fuzzvm::VmRunPerf::default();
-
         // Initialize the output coverage
-        let mut rq_coverage = BTreeSet::new();
+        let mut rq_hitcounts = BTreeMap::new();
 
         // Top of the run iteration loop for the current fuzz case
         loop {
@@ -4154,28 +4216,52 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             }
 
             // Execute the VM
-            let ret = self.run(&mut perf)?;
+            let ret = {
+                let _timer = self.scoped_timer(PerfMark::RqInVm);
+                self.run()?
+            };
 
-            if let FuzzVmExit::CoverageBreakpoint(rip) = &ret {
-                log::debug!("{:#x}: New coverage bp: {rip:#x}", input.fuzz_hash());
-                coverage.insert(VirtAddr(*rip));
+            {
+                let _timer = self.scoped_timer(PerfMark::RqRecordCodeCov);
+                if let FuzzVmExit::CoverageBreakpoint(rip) = &ret {
+                    feedback.record_codecov_hitcount(VirtAddr(*rip));
+                }
             }
 
             // If this breakpoint was a redqueen breakpoint, add the rip and the rflags pairing
             // to the coverage
-            if FUZZER::redqueen_breakpoint_addresses().contains(&self.rip()) {
-                // Keep the Carry and Zero flags as part of the coverage
-                let flag_mask = RFlags::ZERO_FLAG | RFlags::CARRY_FLAG;
-                // flag_mask |= RFlags::SIGN_FLAG;
-                // flag_mask |= RFlags::AUXILIARY_CARRY_FLAG;
+            {
+                let _timer = self.scoped_timer(PerfMark::RqRecordBreakpoint);
+                if let FuzzVmExit::Breakpoint(rip) = &ret {
+                    let rip = *rip;
 
-                let rflags = RFlags::from_bits_truncate(self.rflags() & flag_mask.bits());
+                    if let Some(ref rq_breakpoint_addrs) = self.redqueen_breakpoint_addresses {
+                        if rq_breakpoint_addrs.contains(&rip) {
+                            // Keep the Carry and Zero flags as part of the coverage
+                            let flag_mask = RFlags::ZERO_FLAG | RFlags::CARRY_FLAG;
+                            // flag_mask |= RFlags::SIGN_FLAG;
+                            // flag_mask |= RFlags::AUXILIARY_CARRY_FLAG;
 
-                rq_coverage.insert((VirtAddr(self.rip()), rflags));
+                            let rflags = self.rflags() & flag_mask.bits();
+
+                            // Increment the hit count for this breakpoint by one
+                            let hit_count =
+                                rq_hitcounts.entry((VirtAddr(rip), rflags)).or_insert(0);
+                            *hit_count += 1;
+
+                            let rflags = RFlags::from_bits_truncate(rflags);
+                            feedback.record_redqueen(VirtAddr(rip), rflags, *hit_count);
+                        }
+                    }
+                }
             }
 
             // Handle the FuzzVmExit to determine
-            let ret = handle_vmexit(&ret, self, fuzzer, None, input);
+            let ret = {
+                let _timer = self.scoped_timer(PerfMark::RqHandleVmexit);
+                handle_vmexit(&ret, self, fuzzer, None, input, Some(feedback))
+            };
+
             execution = match ret {
                 Err(e) => {
                     return Err(e);
@@ -4183,18 +4269,20 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
                 Ok(execution) => execution,
             };
 
+            /*
             // During single step, breakpoints aren't triggered. For this reason,
             // we need to check if the instruction is a breakpoint regardless in order to
             // apply fuzzer specific breakpoint logic. We can ignore the "unknown breakpoint"
             // error that is thrown if a breakpoint is not found;
             if self.single_step {
-                if let Ok(new_execution) = self.handle_breakpoint(fuzzer, input) {
+                if let Ok(new_execution) = self.handle_breakpoint(fuzzer, input, Some(coverage)) {
                     execution = new_execution;
                 } else {
                     // Ignore the unknown breakpoint case since we check every instruction due to
                     // single stepping here.
                 }
             }
+            */
 
             // Check if the VM needs to be timed out
             if self.start_time.elapsed() > vm_timeout {
@@ -4203,19 +4291,19 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             }
         }
 
-        Ok(rq_coverage)
+        Ok(())
     }
 
     /// Get the coverage breakpoints hit by the given `input`
     pub fn gather_coverage(
         &mut self,
         fuzzer: &mut FUZZER,
-        input: &FUZZER::Input,
+        input: &InputWithMetadata<FUZZER::Input>,
         current_coverage: &[u64],
         vm_timeout: Duration,
     ) -> Result<Vec<u64>> {
         // Reset the guest state
-        let _perf = self.reset_guest_state(fuzzer)?;
+        self.reset_guest_state(fuzzer)?;
 
         // Reset the fuzzer state
         fuzzer.reset_fuzzer_state();
@@ -4241,9 +4329,6 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         // Initialize the execution for each vmexit
         let mut execution = Execution::Continue;
 
-        // Initialize the performance counters for executing a VM
-        let mut perf = crate::fuzzvm::VmRunPerf::default();
-
         // Initialize the seen coverage from this execution
         let mut seen_coverage = Vec::new();
 
@@ -4255,7 +4340,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             }
 
             // Execute the VM
-            let ret = self.run(&mut perf)?;
+            let ret = self.run()?;
 
             match ret {
                 FuzzVmExit::Breakpoint(rip) | FuzzVmExit::CoverageBreakpoint(rip) => {
@@ -4277,7 +4362,7 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             }
 
             // Handle the FuzzVmExit to determine
-            let ret = handle_vmexit(&ret, self, fuzzer, None, input);
+            let ret = handle_vmexit(&ret, self, fuzzer, None, input, None);
             execution = match ret {
                 Err(e) => {
                     return Err(e);
@@ -4301,6 +4386,103 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         Ok(seen_coverage)
     }
 
+    /// Get the coverage breakpoints hit by the given `input`
+    pub fn gather_feedback<I: IntoIterator<Item = VirtAddr>>(
+        &mut self,
+        fuzzer: &mut FUZZER,
+        input: &InputWithMetadata<FUZZER::Input>,
+        vm_timeout: Duration,
+        coverage_breakpoints: I,
+        coverage_bp_type: BreakpointType,
+    ) -> Result<(Execution, FeedbackTracker)> {
+        let mut feedback = FeedbackTracker::new();
+
+        // Reset the guest state
+        self.reset_guest_state(fuzzer)?;
+
+        // Reset the fuzzer state
+        fuzzer.reset_fuzzer_state();
+
+        // Set the input into the VM as per the fuzzer
+        fuzzer.set_input(input, self)?;
+
+        let mut hit_breakpoints = CoverageBreakpoints::default();
+
+        let cr3 = self.cr3();
+
+        // Reset all of the current breakpoints
+        for bp_addr in coverage_breakpoints {
+            if self.has_breakpoint(bp_addr, cr3) {
+                continue;
+            }
+            let curr_byte = self.read::<u8>(bp_addr, cr3)?;
+            if curr_byte != 0xcc {
+                // Store the original byte for this address
+                hit_breakpoints.insert(bp_addr.into(), curr_byte);
+
+                // Write a breakpoint at this address to look for coverage
+                self.write_bytes_dirty(bp_addr, cr3, &[0xcc])?;
+            }
+        }
+
+        // Initialize the execution for each vmexit
+        let mut execution = Execution::Continue;
+
+        // Top of the run iteration loop for the current fuzz case
+        loop {
+            // Reset the VM if the vmexit handler says so
+            if matches!(execution, Execution::Reset | Execution::CrashReset { .. }) {
+                break;
+            }
+
+            // Execute the VM
+            let ret = self.run()?;
+
+            match ret {
+                FuzzVmExit::Breakpoint(rip) | FuzzVmExit::CoverageBreakpoint(rip) => {
+                    let rip = VirtAddr(rip);
+                    if let Some(orig_byte) = hit_breakpoints.get(&rip) {
+                        feedback.record_codecov(rip);
+
+                        // Restore the original byte for this breakpoint
+                        self.write_bytes_dirty(rip, self.cr3(), &[*orig_byte])?;
+
+                        if coverage_bp_type == BreakpointType::Repeated {
+                            self.restore_breakpoint = Some((rip, self.cr3()));
+                        }
+
+                        // Restored byte, continue execution at the top of the loop
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+
+            // Handle the FuzzVmExit to determine
+            let ret = handle_vmexit(&ret, self, fuzzer, None, input, Some(&mut feedback));
+            execution = match ret {
+                Err(e) => {
+                    return Err(e);
+                }
+                Ok(execution) => execution,
+            };
+
+            // Check if the VM needs to be timed out
+            if self.start_time.elapsed() > vm_timeout {
+                log::warn!("Coverage Timed out.. exiting");
+                execution = Execution::TimeoutReset;
+                break;
+            }
+        }
+
+        // Restore the original bytes that we overwrote with breakpoints
+        for (addr, orig_byte) in hit_breakpoints {
+            self.write_bytes_dirty(addr, self.cr3(), &[orig_byte])?;
+        }
+
+        Ok((execution, feedback))
+    }
+
     /// Internal function used to reset the guest and run with redqueen breakpoints enabled
     ///
     /// # Returns
@@ -4309,13 +4491,15 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
     #[cfg(feature = "redqueen")]
     pub(crate) fn reset_and_run_with_redqueen(
         &mut self,
-        input: &FUZZER::Input,
+        input: &InputWithMetadata<FUZZER::Input>,
         fuzzer: &mut FUZZER,
         vm_timeout: Duration,
-        coverage: &mut BTreeSet<VirtAddr>,
-    ) -> Result<BTreeSet<(VirtAddr, RFlags)>> {
+        feedback: &mut FeedbackTracker,
+    ) -> Result<()> {
+        let _timer = self.scoped_timer(PerfMark::ResetAndRunWithRedqueen);
+
         // Reset the guest state in preparation for redqueen
-        let _perf = self.reset_guest_state(fuzzer)?;
+        self.reset_guest_state(fuzzer)?;
 
         // Reset the fuzzer state
         fuzzer.reset_fuzzer_state();
@@ -4324,200 +4508,222 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         fuzzer.set_input(input, self)?;
 
         // Apply redqueen breakpoints
-        self.apply_redqueen_breakpoints(fuzzer)?;
+        self.apply_redqueen_breakpoints()?;
 
         // Run the guest until reset, gathering redqueen redqueen rules
-        let coverage = self.run_until_reset_redqueen(fuzzer, input, vm_timeout, coverage)?;
+        self.run_until_reset_redqueen(fuzzer, input, vm_timeout, feedback)?;
 
-        Ok(coverage)
+        // Reset the guest state in preparation for redqueen
+        self.reset_guest_state(fuzzer)?;
+
+        // Reset the fuzzer state
+        fuzzer.reset_fuzzer_state();
+
+        // Increase the redqueen iterations counter
+        if let Some(stats) = self.core_stats.as_mut() {
+            stats.lock().unwrap().rq_iterations += 1;
+        }
+
+        Ok(())
     }
 
     /// Populate the `redqueen_rules` for the given `input`
     #[cfg(feature = "redqueen")]
     pub fn gather_redqueen(
         &mut self,
-        input: &FUZZER::Input,
+        orig_input: &InputWithMetadata<FUZZER::Input>,
         fuzzer: &mut FUZZER,
         vm_timeout: Duration,
-        corpus: &mut Vec<<FUZZER as Fuzzer>::Input>,
-        coverage: &mut BTreeSet<VirtAddr>,
-        redqueen_coverage: &mut BTreeSet<(VirtAddr, RFlags)>,
-        time_spent: Duration,
-        metadata_dir: &PathBuf,
+        corpus: &mut Vec<Arc<InputWithMetadata<FUZZER::Input>>>,
+        total_feedback: &mut FeedbackTracker,
+        project_dir: &Path,
+        entropy_threshold: usize,
     ) -> Result<()> {
-        // Init an rng for this gathering of redqueen
-        let mut rng = Rng::new();
-
-        // If we've spent too much time during the recursive redqueen calls, return and
-        // come back to redqueen on a different iteration
-        if time_spent >= self.config.redqueen.timeout {
-            log::info!("Core {:#x} Redqueen TIMEOUT: {time_spent:?}", self.core_id);
-            return Ok(());
-        }
-
-        // Begin the timer for this iteration of redqueen
-        let start_time = std::time::Instant::now();
-
-        // Gather then original redqueen rules for this input
-        let orig_coverage =
-            self.reset_and_run_with_redqueen(input, fuzzer, vm_timeout, coverage)?;
+        let _timer = self.scoped_timer(PerfMark::GatherRedqueen);
 
         // Get the found redqueen rules for this input
-        let fuzz_hash = input.fuzz_hash();
+        let fuzz_hash = orig_input.fuzz_hash();
 
-        if let Some(orig_rules) = self.redqueen_rules.remove(&fuzz_hash) {
-            // Replace all of the 2+ byte substrings that need to be replaced via the redqueen rules
-            // (Colorization phase from the Redqueen paper)
-            // This is to reduce the number of possible redqueen locations in the input
-            let mut max_entropy_input = input.clone();
+        // Start with a fresh feedback tracker to gather ALL of the RQ coverage
+        // (not just the new RQ coverage for this first iteration). There shouldn't be any
+        // new RQ coverage, since no mutations have occurred
+        let mut original_feedback = FeedbackTracker::default();
 
-            for rule in &orig_rules {
-                let candidates = max_entropy_input.get_redqueen_rule_candidates(rule);
+        // Gather then original redqueen rules for this input
+        self.reset_and_run_with_redqueen(orig_input, fuzzer, vm_timeout, &mut original_feedback)?;
 
-                if candidates.len() > self.config.redqueen.entropy_threshold {
-                    for _candidate in candidates {
-                        // Clone the input to attempt to increase the entropy
-                        let mut test_max_entropy_input = max_entropy_input.clone();
+        if let Some(rules) = self.redqueen_rules.remove(&fuzz_hash) {
+            // If there are no rules at all for this input, start with increasing the entropy
+            if rules.is_empty() {
+                if orig_input.metadata.read().unwrap().entropy {
+                    panic!("No rules still after increased entropy 1");
+                }
 
-                        // Attempt to increase the entropy of the input if this input
-                        // has more rule candidates than the entropy threshold
-                        test_max_entropy_input.increase_redqueen_entropy(rule, &mut rng);
+                if let Some(entropy_input) =
+                    self.increase_input_entropy(orig_input, &original_feedback, fuzzer, vm_timeout)?
+                {
+                    entropy_input.metadata.write().unwrap().entropy = true;
 
-                        // Gather the redqueen coverage for this new input
-                        let entropy_coverage = self.reset_and_run_with_redqueen(
-                            &test_max_entropy_input,
-                            fuzzer,
-                            vm_timeout,
-                            coverage,
-                        )?;
+                    // Restart redqueen with the increased entropy input
+                    self.gather_redqueen(
+                        &entropy_input,
+                        fuzzer,
+                        vm_timeout,
+                        corpus,
+                        total_feedback,
+                        project_dir,
+                        entropy_threshold,
+                    )?;
 
-                        if entropy_coverage == orig_coverage {
-                            // Keep this entropy input since it has the same coverage
-                            max_entropy_input = test_max_entropy_input;
-                        }
-                    }
+                    // Restore the original input redqueen rules
+                    self.redqueen_rules.insert(fuzz_hash, rules);
+
+                    // No need to continue with this input since it was re-run with
+                    // increased entropy
+                    return Ok(());
                 }
             }
 
-            let _coverage =
-                self.reset_and_run_with_redqueen(&max_entropy_input, fuzzer, vm_timeout, coverage)?;
+            // Only check the global lock before the rules
+            if crate::FINISHED.load(Ordering::SeqCst) {
+                return Ok(());
+            }
 
-            if let Some(rules) = self.redqueen_rules.remove(&max_entropy_input.fuzz_hash()) {
-                log::info!("Calling RQ from {fuzz_hash:#x}: {rules:x?}");
-                for rule in &rules {
-                    // Apply this redqueen rule
-                    let candidates = max_entropy_input.get_redqueen_rule_candidates(rule);
-                    log::info!("{rule:x?} Candidates {}", candidates.len());
+            let mut start = Instant::now();
 
-                    for candidate in &candidates {
-                        let mut new_input = max_entropy_input.clone();
-                        let original_file = input.fuzz_hash();
+            for rule in rules.iter() {
+                // Check if we are force exiting once a second
+                if start.elapsed() > Duration::from_secs(1) {
+                    if crate::FINISHED.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
 
-                        // Apply the given rule with the candidate
-                        let mutation = new_input.apply_redqueen_rule(rule, candidate);
+                    start = Instant::now();
+                }
 
-                        // Get the coverage of this mutated input, only using the specific redqueen
-                        // breakpoint for this targetted rule
-                        let new_rq_coverage = self.reset_and_run_with_redqueen(
-                            &new_input, fuzzer, vm_timeout, coverage,
+                let input = orig_input.fork();
+                let candidates = input.get_redqueen_rule_candidates(rule);
+
+                // If there are no candidates for this rule, and this input hasn't
+                // been increased entropy ("colorization" from the redqueen paper),
+                // then attempt to increase the entropy and then use that new input
+                // instead of this input
+                if candidates.is_empty()
+                    || candidates.len() > entropy_threshold
+                        && !orig_input.metadata.read().unwrap().entropy
+                {
+                    if let Some(entropy_input) = self.increase_input_entropy(
+                        orig_input,
+                        &original_feedback,
+                        fuzzer,
+                        vm_timeout,
+                    )? {
+                        entropy_input.metadata.write().unwrap().entropy = true;
+
+                        // Restart redqueen with the increased entropy input
+                        self.gather_redqueen(
+                            &entropy_input,
+                            fuzzer,
+                            vm_timeout,
+                            corpus,
+                            total_feedback,
+                            project_dir,
+                            entropy_threshold,
                         )?;
 
-                        // If we've found new coverage, add the new input to the corpus
-                        let mut new_coverage = Vec::new();
-                        for cov in new_rq_coverage {
-                            if redqueen_coverage.insert(cov) {
-                                log::info!(
-                                    "{:?} | {:#x}: New rq bp: {:x?}",
-                                    self.core_id,
-                                    input.fuzz_hash(),
-                                    cov
-                                );
+                        // Restore the original input redqueen rules
+                        self.redqueen_rules.insert(fuzz_hash, rules);
 
-                                new_coverage.push(*cov.0);
-                            }
-                        }
-
-                        // If this input found new coverage, add it to the corpus
-                        // and execute Redqueen on this new input
-                        if !new_coverage.is_empty() {
-                            // Ensure the metadata directory exists
-                            if !metadata_dir.exists() {
-                                std::fs::create_dir(metadata_dir)?;
-                            }
-
-                            // Get the fuzz hash for this input
-                            let hash = new_input.fuzz_hash();
-
-                            let mutation = format!(
-                                "RQ_{}_{candidate:x?}",
-                                mutation.unwrap_or_else(|| String::from("rq_unknown"))
-                            );
-
-                            // Write the metadata for this mutation
-                            let mutation_metadata = crate::fuzz_input::InputMetadata {
-                                original_file,
-                                mutation: vec![mutation],
-                                new_coverage,
-                            };
-
-                            let filepath = metadata_dir.join(format!("{hash:x}"));
-                            std::fs::write(filepath, serde_json::to_string(&mutation_metadata)?)?;
-
-                            let mut input_bytes = Vec::new();
-                            new_input.to_bytes(&mut input_bytes)?;
-                            let filepath = metadata_dir
-                                .parent()
-                                .unwrap()
-                                .join("current_corpus")
-                                .join(format!("{hash:x}"));
-                            std::fs::write(filepath, &input_bytes)?;
-
-                            input_bytes.clear();
-                            input.to_bytes(&mut input_bytes)?;
-                            let filepath = metadata_dir
-                                .parent()
-                                .unwrap()
-                                .join("current_corpus")
-                                .join(format!("{original_file:x}"));
-                            std::fs::write(filepath, &input_bytes)?;
-
-                            // Add the new input to the corpus
-                            corpus.push(new_input.clone());
-
-                            // Recursively attempt to call Redqueen for this ne winput
-                            self.gather_redqueen(
-                                &new_input,
-                                fuzzer,
-                                vm_timeout,
-                                corpus,
-                                coverage,
-                                redqueen_coverage,
-                                time_spent + start_time.elapsed(),
-                                metadata_dir,
-                            )?;
-
-                            // Found a path through the redqueen breakpoint, add the input
-                            // to the corpus and go to the next rule
-                            // break;
-                        }
+                        return Ok(());
                     }
                 }
 
-                // Restore the max entropy input redqueen rules
-                self.redqueen_rules
-                    .insert(max_entropy_input.fuzz_hash(), rules);
-            } else {
-                println!("No rules for {:#x}", max_entropy_input.fuzz_hash());
+                for candidate in &candidates {
+                    // Check if we are force exiting once a second
+                    if start.elapsed() > Duration::from_secs(1) {
+                        if crate::FINISHED.load(Ordering::SeqCst) {
+                            return Ok(());
+                        }
+
+                        start = Instant::now();
+                    }
+
+                    let mut new_input = orig_input.fork();
+
+                    // Apply the given rule with the candidate
+                    let mutation = new_input.apply_redqueen_rule(rule, candidate);
+
+                    // Clear the feedback log
+                    total_feedback.ensure_clean();
+
+                    // Get the coverage of this mutated input, only using the specific redqueen
+                    // breakpoint for this targetted rule
+                    self.reset_and_run_with_redqueen(
+                        &new_input,
+                        fuzzer,
+                        vm_timeout,
+                        total_feedback,
+                    )?;
+
+                    // If this input found new coverage, add it to the corpus
+                    // and execute Redqueen on this new input
+                    if total_feedback.has_new() {
+                        // If we've found new coverage, add the new input to the corpus
+                        let new_coverage = total_feedback.take_log();
+                        new_input.add_new_coverage(new_coverage);
+
+                        // Add this redqueen mutation to the mutations metadata
+                        let mutation = format!(
+                            "RQ_ONESHOT_{}_",
+                            mutation.unwrap_or_else(|| String::from("rq_unknown"))
+                        );
+                        new_input.add_mutation(mutation);
+
+                        // Add the new input to the corpus
+                        let input = Arc::new(new_input);
+                        assert!(!input.metadata.read().unwrap().new_coverage.is_empty());
+                        corpus.push(input.clone());
+
+                        // Save every new input into a total corpus directory. Since we only keep
+                        // the inputs that have unique feedback globally, we discard inputs. This could
+                        // discard inputs that were used as the "original_file" for some other inputs.
+                        // In order to have a total history of inputs, we keep them in this corpus directory
+                        for curr_input in [&input, orig_input] {
+                            crate::utils::save_input_in_project(
+                                curr_input,
+                                project_dir,
+                                "all_local_corpi",
+                            )
+                            .unwrap();
+                        }
+
+                        // Immediately send this input out to be sync'd
+                        if let Some(stats) = self.core_stats.as_mut() {
+                            let mut curr_stats = stats.lock().unwrap();
+
+                            match &mut curr_stats.old_corpus {
+                                None => {
+                                    let old_corpus = corpus.clone();
+                                    curr_stats.old_corpus = Some(old_corpus);
+                                }
+                                Some(ref mut corpus) => corpus.push(input),
+                            }
+                        } else {
+                            panic!("No core stats?!");
+                        }
+                    }
+                }
             }
 
             // Restore the original input redqueen rules
-            self.redqueen_rules.insert(fuzz_hash, orig_rules);
+            self.redqueen_rules.insert(fuzz_hash, rules);
         } else {
-            // No redqueen rules generated for this input
+            // Ensure this hash at least has an entry
+            self.redqueen_rules.insert(fuzz_hash, FxHashSet::new());
         }
 
         // Reset the guest state to remove redqueen breakpoints
-        let _perf = self.reset_guest_state(fuzzer)?;
+        self.reset_guest_state(fuzzer)?;
 
         // Reset the fuzzer state
         fuzzer.reset_fuzzer_state();
@@ -4568,6 +4774,95 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
         }
 
         lines
+    }
+
+    /// Get a scoped timer for performance gathering
+    pub(crate) fn scoped_timer(&self, marker: PerfMark) -> Option<PerfStatTimer<FUZZER>> {
+        self.core_stats
+            .as_ref()
+            .map(|stats| PerfStatTimer::new(stats.clone(), marker))
+    }
+
+    /// Set the possible candidates for the `input` using the `rule`
+    #[cfg(feature = "redqueen")]
+    pub(crate) fn set_redqueen_rule_candidates(
+        &mut self,
+        input: &InputWithMetadata<FUZZER::Input>,
+        rule: RedqueenRule,
+    ) {
+        // Get the redqueen rule candidates
+        let has_candidates = {
+            let _timer = self.scoped_timer(PerfMark::GetRQRuleCandidates);
+            input.has_redqueen_rule_candidates(&rule)
+        };
+
+        // If there are rule candidates, add them to the total rules for this input
+        if has_candidates {
+            let _timer = self.scoped_timer(PerfMark::AddRQRuleCandidates);
+            /*
+            log::info!(
+                "{:#x} inserting {rule:x?} from {:#x}",
+                input.fuzz_hash(),
+                self.rip()
+            );
+            */
+
+            self.redqueen_rules
+                .entry(input.fuzz_hash())
+                .or_insert_with(|| FxHashSet::with_capacity(4))
+                .insert(rule);
+        }
+    }
+
+    /// Increase the entropy of the given input
+    #[cfg(feature = "redqueen")]
+    pub(crate) fn increase_input_entropy(
+        &mut self,
+        orig_input: &InputWithMetadata<FUZZER::Input>,
+        orig_feedback: &FeedbackTracker,
+        fuzzer: &mut FUZZER,
+        vm_timeout: Duration,
+    ) -> Result<Option<InputWithMetadata<FUZZER::Input>>> {
+        let _timer = self.scoped_timer(PerfMark::IncreaseInputEntropy);
+
+        let mut queue = Vec::new();
+        queue.push([0, orig_input.entropy_limit()]);
+
+        let mut best_input = orig_input.fork();
+
+        while let Some([start, end]) = queue.pop() {
+            // Get a fresh input copy for this iteration
+            let mut curr_input = best_input.fork();
+
+            // Increase entropy of this input
+            curr_input
+                .input
+                .increase_entropy(&mut self.rng, start, end)?;
+
+            // Check if this input has the same redqueen feedback
+            let mut temp_feedback = FeedbackTracker::default();
+            self.reset_and_run_with_redqueen(&curr_input, fuzzer, vm_timeout, &mut temp_feedback)?;
+
+            let equal_redqueen = temp_feedback.eq_redqueen(orig_feedback);
+
+            // If the entropy input has the same redqueen feedback, this is a safe region to mutate.
+            // Add it to the results and continue
+            if equal_redqueen {
+                best_input = curr_input;
+            } else if end - start > 1 {
+                // If unsuccessful, go to the next step of the binary search
+                let mid = (end - start) / 2 + start;
+                queue.push([start, mid]);
+                queue.push([mid, end]);
+                self.redqueen_rules.remove(&curr_input.fuzz_hash());
+            }
+        }
+
+        if best_input.fuzz_hash() != orig_input.fuzz_hash() {
+            Ok(Some(best_input))
+        } else {
+            Ok(None)
+        }
     }
 }
 
