@@ -5,8 +5,8 @@ FROM snapchange_base_fuzzer
 WORKDIR /fuzzer
 COPY --chown=${user}:${user} Cargo.toml /fuzzer
 COPY --chown=${user}:${user} build.rs   /fuzzer
-COPY --chown=${user}:${user} snapshot/fuzzvm.qemuregs  /fuzzer/snapshot/fuzzvm.qemuregs
-COPY --chown=${user}:${user} snapshot/vm.log /fuzzer/snapshot/vm.log
+COPY --chown=${user}:${user} ./snapshot/fuzzvm.qemuregs  /fuzzer/snapshot/fuzzvm.qemuregs
+COPY --chown=${user}:${user} ./snapshot/vm.log /fuzzer/snapshot/vm.log
 RUN mkdir /fuzzer/src && echo 'fn test() { println!("NULL test"); }' > /fuzzer/src/lib.rs
 
 # Pre-build the fuzzer and snapchange to cache
@@ -20,4 +20,4 @@ RUN rm /fuzzer/src/lib.rs
 COPY --chown=${user}:${user} src /fuzzer/src
 
 # Start fuzzing
-ENTRYPOINT ["cargo", "run", "-r", "--"]
+ENTRYPOINT ["cargo", "run", "-r", "--", "--project", "/snapshot", "fuzz", "--cores", "8"]
