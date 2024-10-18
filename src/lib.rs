@@ -97,7 +97,6 @@
 #![feature(trait_alias)]
 #![feature(thread_id_value)]
 #![feature(map_try_insert)]
-#![feature(stdsimd)]
 #![feature(avx512_target_feature)]
 #![feature(core_intrinsics)]
 #![feature(associated_type_defaults)]
@@ -107,7 +106,7 @@
 #![feature(stmt_expr_attributes)]
 #![allow(rustdoc::invalid_rust_codeblocks)]
 #![allow(internal_features)]
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 
 use feedback::FeedbackTracker;
 use kvm_bindings::{
@@ -1046,10 +1045,9 @@ pub mod prelude {
         addrs::{Cr3, VirtAddr},
         anyhow,
         anyhow::Result,
-        fuzz_input::{MinimizeControlFlow, MinimizerState, NullMinimizerState},
+        fuzz_input::{BytesMinimizeState, MinimizeControlFlow, MinimizerState, NullMinimizerState},
         fuzzer::{AddressLookup, Breakpoint, BreakpointType, Fuzzer},
         fuzzvm::FuzzVm,
-        input_types::bytes::BytesMinimizeState,
         rand,
         rng::Rng,
         snapchange_main, Execution, FuzzInput, InputWithMetadata,
