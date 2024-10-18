@@ -673,16 +673,17 @@ impl<'a, FUZZER: Fuzzer> FuzzVm<'a, FUZZER> {
             HashMap<u64, Vec<RedqueenArguments>>,
         >,
     ) -> Result<Self> {
+        // Create the IRQ chip to enable the APIC for this VM
+        vm.create_irq_chip().context("Failed to create IRQCHIP")?;
+
         // Create a PIT2 timer
+        // This call is only valid after enabling in-kernel irqchip support via KVM_CREATE_IRQCHIP.
         let pit_config = kvm_pit_config::default();
         vm.create_pit2(pit_config)
             .context(Error::FailedToCreatePIT2)?;
 
         // Set the Task State Segment address to the default TSS base
         vm.set_tss_address(TSS_BASE.try_into()?)?;
-
-        // Create the IRQ chip to enable the APIC for this VM
-        vm.create_irq_chip().context("Failed to create IRQCHIP")?;
 
         // Allocate a CPU for this VM
         let vcpu = vm.create_vcpu(0).context(Error::FailedToCreateVcpu)?;
