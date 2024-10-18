@@ -7,12 +7,10 @@ if [ ! -d ./snapshot ]; then
 fi
 
 # Ensure the base docker containers are built
-pushd ../../
-./make_base_images.sh
-popd
+make base_images
 
 # Build the fuzzer for this example
-docker build -t snapchange_example2:fuzzer . -f ../../Dockerfile.fuzzer
+docker build -t snapchange_example2:fuzzer . -f ../../docker/Dockerfile.fuzzer
 
 # Execute the fuzzer passing the CLI args as if run with `cargo run -r -- `
 docker run \
@@ -22,6 +20,5 @@ docker run \
   -v /dev/kvm:/dev/kvm \
   -v $PWD/snapshot:/snapshot \
   snapchange_example2:fuzzer \
-  --project /snapshot \
   "$@" \
   # END
