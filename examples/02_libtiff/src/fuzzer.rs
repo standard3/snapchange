@@ -35,7 +35,7 @@ impl Fuzzer for Example02Fuzzer {
                 // This is slightly better than a breakpoint since we don't have to
                 // exit the guest which is a bit more costly.
                 let addr = AddressLookup::Virtual(virt_addr, cr3);
-                fuzzvm.patch_bytes_permanent(addr, &[0xc3]);
+                fuzzvm.patch_bytes_permanent(addr, &[0xc3]); // C3 = ret instruction
             }
         }
 
